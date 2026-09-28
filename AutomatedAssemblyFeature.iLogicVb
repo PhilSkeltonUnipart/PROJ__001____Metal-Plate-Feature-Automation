@@ -1,6 +1,13 @@
+```vbnet
 '===========================================================
-' Assembly Scanner - Read Only
-' Scans the active Inventor assembly recursively
+' iLogic - Assembly Plate Scanner
+'
+' READ ONLY
+'
+' Scans the active assembly recursively and creates a
+' useful record for every part found.
+'
+' Nothing in the assembly is modified.
 '===========================================================
 
 Imports System.IO
@@ -8,224 +15,605 @@ Imports Inventor
 
 Sub Main()
 
-    '-----------------------------------------
-    ' Check that the active document is an assembly
-    '-----------------------------------------
+    '=======================================================
+    ' SETTINGS
+    '=======================================================
+
+    'Change this to match your actual naming convention.
+    'For example:
+    '   "PLATE_"
+    '   "SM_"
+    '   "PL"
+    '
+    'Set to "" if you don't want to use filename checking.
+
+    Dim RequiredFilenamePrefix As String = "PLATE_"
+
+
+    '=======================================================
+    ' CHECK ACTIVE DOCUMENT
+    '=======================================================
+
+    If ThisApplication.ActiveDocument Is Nothing Then
+
+        MessageBox.Show( _
+            "No active document found.", _
+            "Plate Scanner")
+
+        Exit Sub
+
+    End If
+
+
+    If ThisApplication.ActiveDocument.DocumentType <> _
+        DocumentTypeEnum.kAssemblyDocumentObject Then
+
+        MessageBox.Show( _
+            "The active document is not an assembly.", _
+            "Plate Scanner")
+
+        Exit Sub
+
+    End If
+
 
     Dim asmDoc As AssemblyDocument
 
-    Try
-        asmDoc = ThisApplication.ActiveDocument
-    Catch
-        MessageBox.Show("Unable to access the active document.", "Assembly Scanner")
-        Exit Sub
-    End Try
+    asmDoc = ThisApplication.ActiveDocument
 
-    If asmDoc.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
-        MessageBox.Show( _
-            "The active document is not an assembly.", _
-            "Assembly Scanner")
-        Exit Sub
-    End If
 
-    '-----------------------------------------
-    ' Start scanning
-    '-----------------------------------------
+    '=======================================================
+    ' START REPORT
+    '=======================================================
 
     Dim report As String = ""
 
-    report = report & "ASSEMBLY SCAN" & vbCrLf
-    report = report & "============================" & vbCrLf
-    report = report & "Assembly: " & asmDoc.DisplayName & vbCrLf
+    report = report & _
+        "====================================================" & vbCrLf
+
+    report = report & _
+        "ASSEMBLY PLATE SCANNER" & vbCrLf
+
+    report = report & _
+        "====================================================" & vbCrLf & vbCrLf
+
+    report = report & _
+        "Assembly: " & asmDoc.DisplayName & vbCrLf
+
+    report = report & _
+        "Date: " & DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss") & vbCrLf
+
     report = report & vbCrLf
 
-    Dim topLevel As ComponentOccurrences
 
-    topLevel = asmDoc.ComponentDefinition.Occurrences
+    '=======================================================
+    ' COUNTERS
+    '=======================================================
 
-    Dim componentCount As Integer = 0
+    Dim TotalComponents As Integer = 0
+    Dim TotalParts As Integer = 0
+    Dim TotalSheetMetal As Integer = 0
+    Dim TotalCandidates As Integer = 0
+    Dim TotalEligible As Integer = 0
 
-    For Each occurrence As ComponentOccurrence In topLevel
+
+    '=======================================================
+    ' SCAN TOP LEVEL
+    '=======================================================
+
+    Dim occurrences As ComponentOccurrences
+
+    occurrences = asmDoc.ComponentDefinition.Occurrences
+
+
+    For Each occurrence As ComponentOccurrence In occurrences
 
         ScanOccurrence( _
             occurrence, _
             0, _
             report, _
-            componentCount)
+            TotalComponents, _
+            TotalParts, _
+            TotalSheetMetal, _
+            TotalCandidates, _
+            TotalEligible, _
+            RequiredFilenamePrefix)
 
     Next
 
-    '-----------------------------------------
-    ' Show results
-    '-----------------------------------------
+
+    '=======================================================
+    ' SUMMARY
+    '=======================================================
 
     report = report & vbCrLf
-    report = report & "============================" & vbCrLf
-    report = report & "Components found: " & componentCount
 
-    MessageBox.Show(report, "Assembly Scanner")
+    report = report & _
+        "====================================================" & vbCrLf
+
+    report = report & _
+        "SUMMARY" & vbCrLf
+
+    report = report & _
+        "====================================================" & vbCrLf
+
+    report = report & _
+        "Total components:       " & TotalComponents & vbCrLf
+
+    report = report & _
+        "Total parts:            " & TotalParts & vbCrLf
+
+    report = report & _
+        "Sheet metal parts:      " & TotalSheetMetal & vbCrLf
+
+    report = report & _
+        "Plate candidates:       " & TotalCandidates & vbCrLf
+
+    report = report & _
+        "Eligible for nibs:      " & TotalEligible & vbCrLf
+
+
+    '=======================================================
+    ' DISPLAY
+    '=======================================================
+
+    'MessageBox has a practical size limit.
+    'For a large assembly the report can therefore become
+    'too large.
+    '
+    'For the first test, display it directly.
+
+    MessageBox.Show( _
+        report, _
+        "Assembly Plate Scanner")
 
 End Sub
 
 
 '===========================================================
-' Recursive component scanner
+' RECURSIVE OCCURRENCE SCANNER
 '===========================================================
 
 Sub ScanOccurrence( _
     occurrence As ComponentOccurrence, _
     level As Integer, _
     ByRef report As String, _
-    ByRef componentCount As Integer)
+    ByRef TotalComponents As Integer, _
+    ByRef TotalParts As Integer, _
+    ByRef TotalSheetMetal As Integer, _
+    ByRef TotalCandidates As Integer, _
+    ByRef TotalEligible As Integer, _
+    RequiredFilenamePrefix As String)
 
-    componentCount = componentCount + 1
 
-    'Indent based on assembly depth
+    TotalComponents = TotalComponents + 1
+
+
+    '-------------------------------------------------------
+    ' Indentation
+    '-------------------------------------------------------
+
     Dim indent As String = ""
 
     For i As Integer = 1 To level
+
         indent = indent & "    "
+
     Next
 
-    '-----------------------------------------
+
+    '-------------------------------------------------------
     ' Basic occurrence information
-    '-----------------------------------------
+    '-------------------------------------------------------
 
-    report = report & _
-        indent & "├─ " & occurrence.Name & vbCrLf
+    Dim occurrenceName As String = occurrence.Name
 
-    report = report & _
-        indent & "│  File: " & GetFileName(occurrence) & vbCrLf
+    Dim fileName As String = ""
+    Dim fullPath As String = ""
 
-    report = report & _
-        indent & "│  Type: " & GetDocumentType(occurrence) & vbCrLf
 
-    '-----------------------------------------
-    ' Check if this is a part
-    '-----------------------------------------
+    Try
 
-    If occurrence.DefinitionDocumentType = _
-        DocumentTypeEnum.kPartDocumentObject Then
+        fullPath = occurrence.Definition.Document.FullFileName
 
-        Dim partDoc As PartDocument
+        If fullPath <> "" Then
 
-        Try
+            fileName = Path.GetFileName(fullPath)
 
-            partDoc = occurrence.Definition.Document
+        End If
 
-            report = report & _
-                indent & "│  Part detected" & vbCrLf
+    Catch
 
-            'Check for sheet metal
-            If partDoc.SubType = _
-                "{9C6D8F8E-1A4E-11D3-BE70-0060B0E6D4F5}" Then
+        fileName = "(unresolved)"
 
-                report = report & _
-                    indent & "│  SHEET METAL: YES" & vbCrLf
+    End Try
 
-            Else
 
-                report = report & _
-                    indent & "│  SHEET METAL: NO" & vbCrLf
-
-            End If
-
-        Catch
-
-            report = report & _
-                indent & "│  Unable to inspect part" & vbCrLf
-
-        End Try
-
-    End If
-
-    '-----------------------------------------
-    ' If this is a subassembly,
-    ' scan its children
-    '-----------------------------------------
+    '-------------------------------------------------------
+    ' ASSEMBLY
+    '-------------------------------------------------------
 
     If occurrence.DefinitionDocumentType = _
         DocumentTypeEnum.kAssemblyDocumentObject Then
 
+
+        report = report & _
+            indent & "┌─ ASSEMBLY" & vbCrLf
+
+        report = report & _
+            indent & "│  " & occurrenceName & vbCrLf
+
+        report = report & _
+            indent & "│  File: " & fileName & vbCrLf
+
+
+        '---------------------------------------------------
+        ' Scan children
+        '---------------------------------------------------
+
         Try
 
-            Dim subOccurrences As ComponentOccurrences
+            Dim children As ComponentOccurrences
 
-            subOccurrences = occurrence.SubOccurrences
+            children = occurrence.SubOccurrences
+
 
             For Each child As ComponentOccurrence _
-                In subOccurrences
+                In children
 
                 ScanOccurrence( _
                     child, _
                     level + 1, _
                     report, _
-                    componentCount)
+                    TotalComponents, _
+                    TotalParts, _
+                    TotalSheetMetal, _
+                    TotalCandidates, _
+                    TotalEligible, _
+                    RequiredFilenamePrefix)
 
             Next
+
 
         Catch
 
             report = report & _
-                indent & "│  Unable to scan subassembly" & vbCrLf
+                indent & "│  ERROR: Unable to scan subassembly" & vbCrLf
 
         End Try
 
+
+        report = report & vbCrLf
+
+        Exit Sub
+
     End If
 
-End Sub
+
+    '-------------------------------------------------------
+    ' Ignore anything that isn't a part
+    '-------------------------------------------------------
+
+    If occurrence.DefinitionDocumentType <> _
+        DocumentTypeEnum.kPartDocumentObject Then
+
+        Exit Sub
+
+    End If
 
 
-'===========================================================
-' Get filename
-'===========================================================
-
-Function GetFileName( _
-    occurrence As ComponentOccurrence) As String
-
-    Try
-
-        Return Path.GetFileName( _
-            occurrence.Definition.Document.FullFileName)
-
-    Catch
-
-        Return "(unresolved)"
-
-    End Try
-
-End Function
+    TotalParts = TotalParts + 1
 
 
-'===========================================================
-' Get document type
-'===========================================================
+    '=======================================================
+    ' PART RECORD
+    '=======================================================
 
-Function GetDocumentType( _
-    occurrence As ComponentOccurrence) As String
+    Dim partDoc As PartDocument
 
     Try
 
-        Select Case occurrence.DefinitionDocumentType
-
-            Case DocumentTypeEnum.kPartDocumentObject
-                Return "PART"
-
-            Case DocumentTypeEnum.kAssemblyDocumentObject
-                Return "ASSEMBLY"
-
-            Case DocumentTypeEnum.kDrawingDocumentObject
-                Return "DRAWING"
-
-            Case Else
-                Return "OTHER"
-
-        End Select
+        partDoc = occurrence.Definition.Document
 
     Catch
 
-        Return "UNKNOWN"
+        report = report & _
+            indent & "┌─ PART - UNRESOLVED" & vbCrLf
+
+        report = report & _
+            indent & "│  " & occurrenceName & vbCrLf
+
+        report = report & vbCrLf
+
+        Exit Sub
 
     End Try
 
-End Function
+
+    '-------------------------------------------------------
+    ' Determine sheet metal
+    '-------------------------------------------------------
+
+    Dim IsSheetMetal As Boolean = False
+
+
+    Try
+
+        If partDoc.SubType = _
+            "{9C6D8F8E-1A4E-11D3-BE70-0060B0E6D4F5}" Then
+
+            IsSheetMetal = True
+
+        End If
+
+    Catch
+
+        IsSheetMetal = False
+
+    End Try
+
+
+    If IsSheetMetal Then
+
+        TotalSheetMetal = TotalSheetMetal + 1
+
+    End If
+
+
+    '-------------------------------------------------------
+    ' Only sheet metal is currently considered a candidate
+    '-------------------------------------------------------
+
+    If Not IsSheetMetal Then
+
+        report = report & _
+            indent & "┌─ PART" & vbCrLf
+
+        report = report & _
+            indent & "│  Name: " & occurrenceName & vbCrLf
+
+        report = report & _
+            indent & "│  File: " & fileName & vbCrLf
+
+        report = report & _
+            indent & "│  Sheet Metal: NO" & vbCrLf
+
+        report = report & _
+            indent & "│  Result: IGNORE" & vbCrLf
+
+        report = report & vbCrLf
+
+        Exit Sub
+
+    End If
+
+
+    '=======================================================
+    ' THIS IS A SHEET METAL PART
+    '=======================================================
+
+    TotalCandidates = TotalCandidates + 1
+
+
+    '-------------------------------------------------------
+    ' iProperties
+    '-------------------------------------------------------
+
+    Dim PartNumber As String = ""
+    Dim Description As String = ""
+    Dim Material As String = ""
+
+
+    Try
+
+        PartNumber = _
+            partDoc.PropertySets( _
+                "Design Tracking Properties"). _
+                Item("Part Number").Value.ToString()
+
+    Catch
+
+        PartNumber = "(not set)"
+
+    End Try
+
+
+    Try
+
+        Description = _
+            partDoc.PropertySets( _
+                "Design Tracking Properties"). _
+                Item("Description").Value.ToString()
+
+    Catch
+
+        Description = "(not set)"
+
+    End Try
+
+
+    Try
+
+        Material = _
+            partDoc.PropertySets( _
+                "Design Tracking Properties"). _
+                Item("Material").Value.ToString()
+
+    Catch
+
+        Material = "(not set)"
+
+    End Try
+
+
+    '=======================================================
+    ' SHEET METAL THICKNESS
+    '=======================================================
+
+    Dim Thickness As String = "(unknown)"
+
+
+    Try
+
+        Dim smDef As SheetMetalComponentDefinition
+
+        smDef = partDoc.ComponentDefinition
+
+
+        Dim thicknessValue As Double
+
+        thicknessValue = smDef.Thickness.Value
+
+
+        'Inventor internal length units are cm.
+        'Convert to mm.
+
+        Dim thicknessMM As Double
+
+        thicknessMM = thicknessValue * 10
+
+
+        Thickness = _
+            thicknessMM.ToString("0.00") & " mm"
+
+
+    Catch
+
+        Thickness = "(unknown)"
+
+    End Try
+
+
+    '=======================================================
+    ' NAMING CONVENTION CHECK
+    '=======================================================
+
+    Dim NamingMatch As Boolean = True
+
+
+    If RequiredFilenamePrefix <> "" Then
+
+        If fileName.ToUpper().StartsWith( _
+            RequiredFilenamePrefix.ToUpper()) Then
+
+            NamingMatch = True
+
+        Else
+
+            NamingMatch = False
+
+        End If
+
+    End If
+
+
+    '=======================================================
+    ' DETERMINE ELIGIBILITY
+    '=======================================================
+
+    Dim Eligible As Boolean = True
+
+    Dim Reason As String = ""
+
+
+    If Not NamingMatch Then
+
+        Eligible = False
+
+        Reason = _
+            "Filename does not match naming convention."
+
+    End If
+
+
+    If Eligible Then
+
+        TotalEligible = TotalEligible + 1
+
+    End If
+
+
+    '=======================================================
+    ' WRITE CANDIDATE RECORD
+    '=======================================================
+
+    report = report & vbCrLf
+
+    report = report & _
+        indent & "╔════════════════════════════════════════════════" & vbCrLf
+
+    report = report & _
+        indent & "║ PLATE CANDIDATE" & vbCrLf
+
+    report = report & _
+        indent & "╠════════════════════════════════════════════════" & vbCrLf
+
+
+    report = report & _
+        indent & "║ Occurrence:    " & occurrenceName & vbCrLf
+
+    report = report & _
+        indent & "║ File:          " & fileName & vbCrLf
+
+    report = report & _
+        indent & "║ Path:          " & fullPath & vbCrLf
+
+    report = report & _
+        indent & "║ Sheet Metal:   YES" & vbCrLf
+
+    r
+
+    If RequiredFilenamePrefix <> "" Then
+
+        report = report & _
+            indent & "║ Naming Check:  " & _
+            IIf(NamingMatch, "PASS", "FAIL") & vbCrLf
+
+    Else
+
+        report = report & _
+            indent & "║ Naming Check:  DISABLED" & vbCrLf
+
+    End If
+
+
+    report = report & _
+        indent & "║" & vbCrLf
+
+
+    If Eligible Then
+
+        report = report & _
+            indent & "║ RESULT:        ELIGIBLE" & vbCrLf
+
+    Else
+
+        report = report & _
+            indent & "║ RESULT:        NOT ELIGIBLE" & vbCrLf
+
+        report = report & _
+            indent & "║ REASON:        " & Reason & vbCrLf
+
+    End If
+
+
+    report = report & _
+        indent & "╚════════════════════════════════════════════════" & vbCrLf
+
+
+End Subeport = report & _
+        indent & "║ Thickness:     " & Thickness & vbCrLf
+
+    report = report & _
+        indent & "║ Part Number:   " & PartNumber & vbCrLf
+
+    report = report & _
+        indent & "║ Description:   " & Description & vbCrLf
+
+    report = report & _
+        indent & "║ Material:      " & Material & vbCrLf
+
+    report = report & _
+        indent & "║" & vbCrLf
+
+```
