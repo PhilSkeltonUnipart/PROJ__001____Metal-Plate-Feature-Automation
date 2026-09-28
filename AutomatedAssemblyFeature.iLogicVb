@@ -1,33 +1,47 @@
+```vbnet
 '===========================================================
-' iLogic - Assembly Plate Scanner
+' iLogic - Assembly / Plate Scanner
 '
 ' READ ONLY
 '
-' Naming convention:
+'===========================================================
+'
+' PART NAMING CONVENTION
 '
 '     XXXX-CCC-VVBB-NN
 '
-'     XXXX = Project number       (4 numbers)
-'     CCC  = Project identifier   (3 letters)
-'     VV   = Component type       (2 letters)
-'     BB   = Component number     (2 numbers)
-'     NN   = Revision              (2 numbers)
-'
 ' Example:
 '
-'     1234-ABC-PL07-03
+'     9187-DCS-PL07-03
 '
-'     Project:       1234
-'     Identifier:    ABC
-'     Component:     PL
-'     Number:        07
-'     Revision:      03
+'     XXXX = Project number
+'     CCC  = Project identifier
+'     VV   = Component type
+'     BB   = Component number
+'     NN   = Revision
+'
+'
+' ASSEMBLY NAMING CONVENTION
+'
+'     XXXX-DESCRIPTION-TTNN-VV
+'
+' Examples:
+'
+'     9187-DitchCrossingSlab-GA01-01
+'     9187-InternalStructure-SA01-01
+'
+'     XXXX        = Project number
+'     DESCRIPTION = Variable-length description
+'     TT          = Assembly type (GA / SA etc.)
+'     NN          = Assembly number
+'     VV          = Revision
 '
 '===========================================================
 
 Imports System.IO
 Imports System.Text.RegularExpressions
 Imports Inventor
+
 
 Sub Main()
 
@@ -47,7 +61,7 @@ Sub Main()
 
         MessageBox.Show( _
             "No active document found.", _
-            "Assembly Plate Scanner")
+            "Assembly Scanner")
 
         Exit Sub
 
@@ -59,7 +73,7 @@ Sub Main()
 
         MessageBox.Show( _
             "The active document is not an assembly.", _
-            "Assembly Plate Scanner")
+            "Assembly Scanner")
 
         Exit Sub
 
@@ -72,6 +86,36 @@ Sub Main()
 
 
     '=======================================================
+    ' PARSE TOP-LEVEL ASSEMBLY NAME
+    '=======================================================
+
+    Dim topAssemblyName As String
+
+    topAssemblyName = _
+        Path.GetFileNameWithoutExtension( _
+            asmDoc.DisplayName)
+
+
+    Dim TopAssemblyValid As Boolean = False
+
+    Dim TopProjectNumber As String = ""
+    Dim TopDescription As String = ""
+    Dim TopAssemblyType As String = ""
+    Dim TopAssemblyNumber As String = ""
+    Dim TopRevision As String = ""
+
+
+    ParseAssemblyName( _
+        topAssemblyName, _
+        TopAssemblyValid, _
+        TopProjectNumber, _
+        TopDescription, _
+        TopAssemblyType, _
+        TopAssemblyNumber, _
+        TopRevision)
+
+
+    '=======================================================
     ' START REPORT
     '=======================================================
 
@@ -81,16 +125,51 @@ Sub Main()
         "====================================================" & vbCrLf
 
     report = report & _
-        "ASSEMBLY PLATE SCANNER" & vbCrLf
+        "INVENTOR ASSEMBLY SCANNER" & vbCrLf
 
     report = report & _
         "====================================================" & vbCrLf & vbCrLf
 
-    report = report & _
-        "Assembly: " & asmDoc.DisplayName & vbCrLf
 
     report = report & _
-        "Date: " & DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss") & vbCrLf
+        "TOP LEVEL ASSEMBLY" & vbCrLf
+
+    report = report & _
+        "----------------------------------------------------" & vbCrLf
+
+    report = report & _
+        "Name:             " & _
+        topAssemblyName & vbCrLf
+
+    report = report & _
+        "Naming valid:     " & _
+        IfText(TopAssemblyValid, "YES", "NO") & vbCrLf
+
+
+    If TopAssemblyValid Then
+
+        report = report & _
+            "Project:          " & _
+            TopProjectNumber & vbCrLf
+
+        report = report & _
+            "Description:      " & _
+            TopDescription & vbCrLf
+
+        report = report & _
+            "Assembly type:    " & _
+            TopAssemblyType & vbCrLf
+
+        report = report & _
+            "Assembly number:  " & _
+            TopAssemblyNumber & vbCrLf
+
+        report = report & _
+            "Revision:         " & _
+            TopRevision & vbCrLf
+
+    End If
+
 
     report = report & vbCrLf
 
@@ -105,6 +184,7 @@ Sub Main()
     Dim TotalPLParts As Integer = 0
     Dim TotalEligible As Integer = 0
     Dim TotalInvalidNames As Integer = 0
+    Dim TotalAssemblies As Integer = 0
 
 
     '=======================================================
@@ -113,10 +193,12 @@ Sub Main()
 
     Dim occurrences As ComponentOccurrences
 
-    occurrences = asmDoc.ComponentDefinition.Occurrences
+    occurrences = _
+        asmDoc.ComponentDefinition.Occurrences
 
 
-    For Each occurrence As ComponentOccurrence In occurrences
+    For Each occurrence As ComponentOccurrence _
+        In occurrences
 
         ScanOccurrence( _
             occurrence, _
@@ -128,6 +210,7 @@ Sub Main()
             TotalPLParts, _
             TotalEligible, _
             TotalInvalidNames, _
+            TotalAssemblies, _
             PlateComponentType)
 
     Next
@@ -149,22 +232,32 @@ Sub Main()
         "====================================================" & vbCrLf
 
     report = report & _
-        "Total components:       " & TotalComponents & vbCrLf
+        "Assemblies:             " & _
+        TotalAssemblies & vbCrLf
 
     report = report & _
-        "Total parts:            " & TotalParts & vbCrLf
+        "Total components:       " & _
+        TotalComponents & vbCrLf
 
     report = report & _
-        "Sheet metal parts:      " & TotalSheetMetal & vbCrLf
+        "Total parts:            " & _
+        TotalParts & vbCrLf
 
     report = report & _
-        "PL components:          " & TotalPLParts & vbCrLf
+        "Sheet metal parts:      " & _
+        TotalSheetMetal & vbCrLf
 
     report = report & _
-        "Eligible plates:        " & TotalEligible & vbCrLf
+        "PL components:          " & _
+        TotalPLParts & vbCrLf
 
     report = report & _
-        "Invalid filenames:      " & TotalInvalidNames & vbCrLf
+        "Eligible plates:        " & _
+        TotalEligible & vbCrLf
+
+    report = report & _
+        "Invalid filenames:      " & _
+        TotalInvalidNames & vbCrLf
 
 
     '=======================================================
@@ -173,7 +266,7 @@ Sub Main()
 
     MessageBox.Show( _
         report, _
-        "Assembly Plate Scanner")
+        "Inventor Assembly Scanner")
 
 End Sub
 
@@ -192,6 +285,7 @@ Sub ScanOccurrence( _
     ByRef TotalPLParts As Integer, _
     ByRef TotalEligible As Integer, _
     ByRef TotalInvalidNames As Integer, _
+    ByRef TotalAssemblies As Integer, _
     PlateComponentType As String)
 
 
@@ -218,13 +312,17 @@ Sub ScanOccurrence( _
     Dim fileName As String = ""
     Dim fullPath As String = ""
 
+
     Try
 
-        fullPath = occurrence.Definition.Document.FullFileName
+        fullPath = _
+            occurrence.Definition.Document.FullFileName
+
 
         If fullPath <> "" Then
 
-            fileName = Path.GetFileName(fullPath)
+            fileName = _
+                Path.GetFileName(fullPath)
 
         End If
 
@@ -243,15 +341,89 @@ Sub ScanOccurrence( _
         DocumentTypeEnum.kAssemblyDocumentObject Then
 
 
+        TotalAssemblies = TotalAssemblies + 1
+
+
+        '---------------------------------------------------
+        ' Parse assembly name
+        '---------------------------------------------------
+
+        Dim assemblyBaseName As String = ""
+
+        assemblyBaseName = _
+            Path.GetFileNameWithoutExtension(fileName)
+
+
+        Dim AssemblyValid As Boolean = False
+
+        Dim ProjectNumber As String = ""
+        Dim Description As String = ""
+        Dim AssemblyType As String = ""
+        Dim AssemblyNumber As String = ""
+        Dim Revision As String = ""
+
+
+        ParseAssemblyName( _
+            assemblyBaseName, _
+            AssemblyValid, _
+            ProjectNumber, _
+            Description, _
+            AssemblyType, _
+            AssemblyNumber, _
+            Revision)
+
+
+        '---------------------------------------------------
+        ' Report assembly
+        '---------------------------------------------------
+
+        report = report & vbCrLf
+
         report = report & _
             indent & "┌─ ASSEMBLY" & vbCrLf
 
         report = report & _
-            indent & "│  " & occurrence.Name & vbCrLf
+            indent & "│  Name: " & _
+            assemblyBaseName & vbCrLf
 
         report = report & _
-            indent & "│  File: " & fileName & vbCrLf
+            indent & "│  File: " & _
+            fileName & vbCrLf
 
+
+        If AssemblyValid Then
+
+            report = report & _
+                indent & "│  Project: " & _
+                ProjectNumber & vbCrLf
+
+            report = report & _
+                indent & "│  Description: " & _
+                Description & vbCrLf
+
+            report = report & _
+                indent & "│  Type: " & _
+                AssemblyType & vbCrLf
+
+            report = report & _
+                indent & "│  Number: " & _
+                AssemblyNumber & vbCrLf
+
+            report = report & _
+                indent & "│  Revision: " & _
+                Revision & vbCrLf
+
+        Else
+
+            report = report & _
+                indent & "│  NAMING: INVALID" & vbCrLf
+
+        End If
+
+
+        '---------------------------------------------------
+        ' Scan children
+        '---------------------------------------------------
 
         Try
 
@@ -273,6 +445,7 @@ Sub ScanOccurrence( _
                     TotalPLParts, _
                     TotalEligible, _
                     TotalInvalidNames, _
+                    TotalAssemblies, _
                     PlateComponentType)
 
             Next
@@ -281,7 +454,9 @@ Sub ScanOccurrence( _
         Catch
 
             report = report & _
-                indent & "│  ERROR: Unable to scan subassembly" & vbCrLf
+                indent & _
+                "│  ERROR: Unable to scan subassembly" & _
+                vbCrLf
 
         End Try
 
@@ -310,6 +485,7 @@ Sub ScanOccurrence( _
 
     Dim partDoc As PartDocument
 
+
     Try
 
         partDoc = occurrence.Definition.Document
@@ -317,10 +493,12 @@ Sub ScanOccurrence( _
     Catch
 
         report = report & _
-            indent & "┌─ PART - UNRESOLVED" & vbCrLf
+            indent & _
+            "┌─ PART - UNRESOLVED" & vbCrLf
 
         report = report & _
-            indent & "│  " & occurrence.Name & vbCrLf
+            indent & _
+            "│  " & occurrence.Name & vbCrLf
 
         report = report & vbCrLf
 
@@ -354,16 +532,18 @@ Sub ScanOccurrence( _
 
     If IsSheetMetal Then
 
-        TotalSheetMetal = TotalSheetMetal + 1
+        TotalSheetMetal = _
+            TotalSheetMetal + 1
 
     End If
 
 
     '=======================================================
-    ' GET FILENAME WITHOUT EXTENSION
+    ' GET PART FILENAME
     '=======================================================
 
     Dim baseFileName As String = ""
+
 
     If fileName <> "(unresolved)" Then
 
@@ -374,51 +554,26 @@ Sub ScanOccurrence( _
 
 
     '=======================================================
-    ' PARSE NAMING CONVENTION
+    ' PARSE PART NAME
     '=======================================================
 
     Dim NamingValid As Boolean = False
 
-    Dim ProjectNumber As String = ""
-    Dim ProjectIdentifier As String = ""
+    Dim PartProjectNumber As String = ""
+    Dim PartProjectIdentifier As String = ""
     Dim ComponentType As String = ""
     Dim ComponentNumber As String = ""
-    Dim Revision As String = ""
+    Dim PartRevision As String = ""
 
 
-    'Expected:
-    '
-    'XXXX-CCC-VVBB-NN
-    '
-    'Example:
-    '
-    '1234-ABC-PL07-03
-
-    Dim pattern As String = _
-        "^([0-9]{4})-([A-Za-z]{3})-([A-Za-z]{2})([0-9]{2})-([0-9]{2})$"
-
-
-    Dim match As Match = _
-        Regex.Match(baseFileName, pattern)
-
-
-    If match.Success Then
-
-        NamingValid = True
-
-        ProjectNumber = match.Groups(1).Value
-
-        ProjectIdentifier = _
-            match.Groups(2).Value.ToUpper()
-
-        ComponentType = _
-            match.Groups(3).Value.ToUpper()
-
-        ComponentNumber = match.Groups(4).Value
-
-        Revision = match.Groups(5).Value
-
-    End If
+    ParsePartName( _
+        baseFileName, _
+        NamingValid, _
+        PartProjectNumber, _
+        PartProjectIdentifier, _
+        ComponentType, _
+        ComponentNumber, _
+        PartRevision)
 
 
     '=======================================================
@@ -430,7 +585,7 @@ Sub ScanOccurrence( _
 
     If NamingValid Then
 
-        If ComponentType = _
+        If ComponentType.ToUpper() = _
             PlateComponentType.ToUpper() Then
 
             IsPL = True
@@ -442,23 +597,17 @@ Sub ScanOccurrence( _
 
     If IsPL Then
 
-        TotalPLParts = TotalPLParts + 1
+        TotalPLParts = _
+            TotalPLParts + 1
 
     End If
 
 
     '=======================================================
-    ' ONLY SHOW INTERESTING PARTS
-    '
-    ' For now:
-    '
-    '   - All PL parts
-    '   - All sheet metal parts with invalid names
-    '
-    ' This lets us identify naming problems.
+    ' IGNORE VALID NON-PL COMPONENTS
     '=======================================================
 
-    If Not IsPL And NamingValid Then
+    If NamingValid And Not IsPL Then
 
         Exit Sub
 
@@ -466,11 +615,11 @@ Sub ScanOccurrence( _
 
 
     '=======================================================
-    ' GET iPROPERTIES
+    ' iPROPERTIES
     '=======================================================
 
     Dim PartNumber As String = ""
-    Dim Description As String = ""
+    Dim PartDescription As String = ""
     Dim Material As String = ""
 
 
@@ -490,14 +639,14 @@ Sub ScanOccurrence( _
 
     Try
 
-        Description = _
+        PartDescription = _
             partDoc.PropertySets( _
                 "Design Tracking Properties"). _
                 Item("Description").Value.ToString()
 
     Catch
 
-        Description = "(not set)"
+        PartDescription = "(not set)"
 
     End Try
 
@@ -537,9 +686,6 @@ Sub ScanOccurrence( _
             thicknessValue = smDef.Thickness.Value
 
 
-            'Inventor internal length units = cm
-            'Convert to mm
-
             Dim thicknessMM As Double
 
             thicknessMM = thicknessValue * 10
@@ -574,8 +720,10 @@ Sub ScanOccurrence( _
         Reason = _
             "Filename does not match XXXX-CCC-VVBB-NN."
 
+
         TotalInvalidNames = _
             TotalInvalidNames + 1
+
 
     ElseIf Not IsPL Then
 
@@ -586,55 +734,56 @@ Sub ScanOccurrence( _
             ComponentType & _
             ", not PL."
 
+
     ElseIf Not IsSheetMetal Then
 
         Eligible = False
 
         Reason = _
-            "Filename identifies a PL component, " & _
-            "but Inventor does not identify it as sheet metal."
+            "Component is named as PL but is not " & _
+            "identified by Inventor as sheet metal."
 
     End If
 
 
     If Eligible Then
 
-        TotalEligible = TotalEligible + 1
+        TotalEligible = _
+            TotalEligible + 1
 
     End If
 
 
     '=======================================================
-    ' WRITE RECORD
+    ' WRITE PLATE RECORD
     '=======================================================
 
     report = report & vbCrLf
 
     report = report & _
-        indent & "╔════════════════════════════════════════════════" & vbCrLf
+        indent & _
+        "╔════════════════════════════════════════════════" & _
+        vbCrLf
 
     report = report & _
-        indent & "║ PLATE CANDIDATE" & vbCrLf
+        indent & _
+        "║ PLATE CANDIDATE" & vbCrLf
 
     report = report & _
-        indent & "╠════════════════════════════════════════════════" & vbCrLf
+        indent & _
+        "╠════════════════════════════════════════════════" & _
+        vbCrLf
 
 
     report = report & _
-        indent & "║ Occurrence:       " & _
+        indent & _
+        "║ Occurrence:       " & _
         occurrence.Name & vbCrLf
 
     report = report & _
-        indent & "║ File:             " & _
+        indent & _
+        "║ File:             " & _
         fileName & vbCrLf
-
-    report = report & _
-        indent & "║ Path:             " & _
-        fullPath & vbCrLf
-
-
-    report = report & _
-        indent & "║" & vbCrLf
 
 
     '-------------------------------------------------------
@@ -642,41 +791,48 @@ Sub ScanOccurrence( _
     '-------------------------------------------------------
 
     report = report & _
-        indent & "║ NAMING" & vbCrLf
+        indent & _
+        "║" & vbCrLf
+
+    report = report & _
+        indent & _
+        "║ NAMING" & vbCrLf
 
 
     report = report & _
-        indent & "║   Valid:          " & _
+        indent & _
+        "║   Valid:          " & _
         IfText(NamingValid, "YES", "NO") & vbCrLf
 
 
     If NamingValid Then
 
         report = report & _
-            indent & "║   Project:        " & _
-            ProjectNumber & vbCrLf
+            indent & _
+            "║   Project:        " & _
+            PartProjectNumber & vbCrLf
 
         report = report & _
-            indent & "║   Identifier:     " & _
-            ProjectIdentifier & vbCrLf
+            indent & _
+            "║   Identifier:     " & _
+            PartProjectIdentifier & vbCrLf
 
         report = report & _
-            indent & "║   Component Type:  " & _
+            indent & _
+            "║   Component Type: " & _
             ComponentType & vbCrLf
 
         report = report & _
-            indent & "║   Component No:   " & _
+            indent & _
+            "║   Component No:   " & _
             ComponentNumber & vbCrLf
 
         report = report & _
-            indent & "║   Revision:       " & _
-            Revision & vbCrLf
+            indent & _
+            "║   Revision:       " & _
+            PartRevision & vbCrLf
 
     End If
-
-
-    report = report & _
-        indent & "║" & vbCrLf
 
 
     '-------------------------------------------------------
@@ -684,69 +840,254 @@ Sub ScanOccurrence( _
     '-------------------------------------------------------
 
     report = report & _
-        indent & "║ INVENTOR" & vbCrLf
+        indent & _
+        "║" & vbCrLf
 
     report = report & _
-        indent & "║   Sheet Metal:    " & _
+        indent & _
+        "║ INVENTOR" & vbCrLf
+
+    report = report & _
+        indent & _
+        "║   Sheet Metal:    " & _
         IfText(IsSheetMetal, "YES", "NO") & vbCrLf
 
     report = report & _
-        indent & "║   Thickness:      " & _
+        indent & _
+        "║   Thickness:      " & _
         Thickness & vbCrLf
 
     report = report & _
-        indent & "║   Part Number:    " & _
+        indent & _
+        "║   Part Number:    " & _
         PartNumber & vbCrLf
 
     report = report & _
-        indent & "║   Description:    " & _
-        Description & vbCrLf
+        indent & _
+        "║   Description:    " & _
+        PartDescription & vbCrLf
 
     report = report & _
-        indent & "║   Material:       " & _
+        indent & _
+        "║   Material:       " & _
         Material & vbCrLf
-
-
-    report = report & _
-        indent & "║" & vbCrLf
 
 
     '-------------------------------------------------------
     ' Result
     '-------------------------------------------------------
 
+    report = report & _
+        indent & _
+        "║" & vbCrLf
+
+
     If Eligible Then
 
         report = report & _
-            indent & "║ RESULT:           ELIGIBLE FOR NIB PROCESSING" & vbCrLf
+            indent & _
+            "║ RESULT:           ELIGIBLE FOR NIB PROCESSING" & _
+            vbCrLf
 
     Else
 
         report = report & _
-            indent & "║ RESULT:           NOT ELIGIBLE" & vbCrLf
+            indent & _
+            "║ RESULT:           NOT ELIGIBLE" & _
+            vbCrLf
 
         report = report & _
-            indent & "║ REASON:           " & _
+            indent & _
+            "║ REASON:           " & _
             Reason & vbCrLf
 
     End If
 
 
     report = report & _
-        indent & "╚════════════════════════════════════════════════" & vbCrLf
+        indent & _
+        "╚════════════════════════════════════════════════" & _
+        vbCrLf
 
 
 End Sub
 
 
 '===========================================================
-' SIMPLE TRUE/FALSE TEXT FUNCTION
+' PARSE PART NAME
+'
+' XXXX-CCC-VVBB-NN
+'
+' Example:
+'
+' 9187-DCS-PL07-03
+'
+'===========================================================
+
+Sub ParsePartName( _
+    fileName As String, _
+    ByRef Valid As Boolean, _
+    ByRef ProjectNumber As String, _
+    ByRef ProjectIdentifier As String, _
+    ByRef ComponentType As String, _
+    ByRef ComponentNumber As String, _
+    ByRef Revision As String)
+
+
+    Valid = False
+
+
+    ProjectNumber = ""
+    ProjectIdentifier = ""
+    ComponentType = ""
+    ComponentNumber = ""
+    Revision = ""
+
+
+    Dim pattern As String = _
+        "^([0-9]{4})-([A-Za-z]{3})-([A-Za-z]{2})([0-9]{2})-([0-9]{2})$"
+
+
+    Dim match As Match = _
+        Regex.Match(fileName, pattern)
+
+
+    If Not match.Success Then
+
+        Exit Sub
+
+    End If
+
+
+    Valid = True
+
+
+    ProjectNumber = _
+        match.Groups(1).Value
+
+
+    ProjectIdentifier = _
+        match.Groups(2).Value.ToUpper()
+
+
+    ComponentType = _
+        match.Groups(3).Value.ToUpper()
+
+
+    ComponentNumber = _
+        match.Groups(4).Value
+
+
+    Revision = _
+        match.Groups(5).Value
+
+
+End Sub
+
+
+'===========================================================
+' PARSE ASSEMBLY NAME
+'
+' XXXX-DESCRIPTION-TTNN-VV
+'
+' Example:
+'
+' 9187-DitchCrossingSlab-GA01-01
+'
+' 9187-InternalStructure-SA01-01
+'
+'===========================================================
+
+Sub ParseAssemblyName( _
+    fileName As String, _
+    ByRef Valid As Boolean, _
+    ByRef ProjectNumber As String, _
+    ByRef Description As String, _
+    ByRef AssemblyType As String, _
+    ByRef AssemblyNumber As String, _
+    ByRef Revision As String)
+
+
+    Valid = False
+
+
+    ProjectNumber = ""
+    Description = ""
+    AssemblyType = ""
+    AssemblyNumber = ""
+    Revision = ""
+
+
+    '-------------------------------------------------------
+    ' The description is deliberately flexible.
+    '
+    ' We only enforce:
+    '
+    '   1. Four numbers at the beginning
+    '   2. A descriptive section
+    '   3. Two letters + two numbers
+    '   4. Two revision numbers
+    '
+    ' This allows:
+    '
+    ' 9187-DitchCrossingSlab-GA01-01
+    '
+    ' and:
+    '
+    ' 9187-InternalStructure-SA01-01
+    '
+    '-------------------------------------------------------
+
+    Dim pattern As String = _
+        "^([0-9]{4})-(.+)-([A-Za-z]{2})([0-9]{2})-([0-9]{2})$"
+
+
+    Dim match As Match = _
+        Regex.Match(fileName, pattern)
+
+
+    If Not match.Success Then
+
+        Exit Sub
+
+    End If
+
+
+    Valid = True
+
+
+    ProjectNumber = _
+        match.Groups(1).Value
+
+
+    Description = _
+        match.Groups(2).Value
+
+
+    AssemblyType = _
+        match.Groups(3).Value.ToUpper()
+
+
+    AssemblyNumber = _
+        match.Groups(4).Value
+
+
+    Revision = _
+        match.Groups(5).Value
+
+
+End Sub
+
+
+'===========================================================
+' TRUE / FALSE TEXT
 '===========================================================
 
 Function IfText( _
     condition As Boolean, _
     trueText As String, _
     falseText As String) As String
+
 
     If condition Then
 
@@ -758,4 +1099,7 @@ Function IfText( _
 
     End If
 
+
 End Function
+```
+
