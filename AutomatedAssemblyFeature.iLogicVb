@@ -884,26 +884,139 @@ Function ParseAssemblyName( _
 
 End Function
 
-
 ' ============================================================
 ' DISPLAY LOG
+'
+' Scrollable log window.
+'
 ' ============================================================
 
 Sub ShowLog()
 
+    ' --------------------------------------------------------
+    ' GET COMPLETE LOG
+    ' --------------------------------------------------------
 
     Dim LogText As String = _
         Logger.GetText()
 
 
-    MsgBox( _
-        LogText, _
-        MsgBoxStyle.Information, _
-        "Inventor Nib Automation Log")
+    ' --------------------------------------------------------
+    ' CREATE FORM
+    ' --------------------------------------------------------
+
+    Dim LogForm As New System.Windows.Forms.Form
+
+
+    LogForm.Text = _
+        "Inventor Nib Automation Log"
+
+
+    LogForm.StartPosition = _
+        System.Windows.Forms.FormStartPosition.CenterScreen
+
+
+    ' --------------------------------------------------------
+    ' FORM SIZE
+    '
+    ' Set dimensions directly rather than using
+    ' System.Drawing.Size.
+    ' --------------------------------------------------------
+
+    LogForm.Width = 1000
+
+    LogForm.Height = 700
+
+
+    LogForm.MaximizeBox = True
+
+    LogForm.MinimizeBox = True
+
+
+    ' --------------------------------------------------------
+    ' CREATE LOG TEXT BOX
+    ' --------------------------------------------------------
+
+    Dim LogBox As New System.Windows.Forms.TextBox
+
+
+    LogBox.Multiline = True
+
+
+    LogBox.ReadOnly = True
+
+
+    ' Vertical AND horizontal scrollbars.
+
+    LogBox.ScrollBars = _
+        System.Windows.Forms.ScrollBars.Both
+
+
+    ' Don't wrap long diagnostic lines.
+
+    LogBox.WordWrap = False
+
+
+    ' Fill the available window.
+
+    LogBox.Dock = _
+        System.Windows.Forms.DockStyle.Fill
+
+
+    LogBox.Text = LogText
+
+
+    ' --------------------------------------------------------
+    ' CREATE CLOSE BUTTON
+    ' --------------------------------------------------------
+
+    Dim CloseButton As _
+        New System.Windows.Forms.Button
+
+
+    CloseButton.Text = "Close"
+
+
+    CloseButton.Width = 100
+
+
+    CloseButton.Height = 30
+
+
+    CloseButton.Dock = _
+        System.Windows.Forms.DockStyle.Bottom
+
+
+    CloseButton.DialogResult = _
+        System.Windows.Forms.DialogResult.OK
+
+
+    ' --------------------------------------------------------
+    ' ADD CONTROLS
+    ' --------------------------------------------------------
+
+    LogForm.Controls.Add(LogBox)
+
+    LogForm.Controls.Add(CloseButton)
+
+
+    ' --------------------------------------------------------
+    ' BUTTON BEHAVIOUR
+    ' --------------------------------------------------------
+
+    LogForm.AcceptButton = CloseButton
+
+    LogForm.CancelButton = CloseButton
+
+
+    ' --------------------------------------------------------
+    ' DISPLAY
+    ' --------------------------------------------------------
+
+    LogForm.ShowDialog()
 
 
 End Sub
-
 
 ' ============================================================
 ' LOGGER
