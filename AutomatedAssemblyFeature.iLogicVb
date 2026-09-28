@@ -1,0 +1,231 @@
+'===========================================================
+' Assembly Scanner - Read Only
+' Scans the active Inventor assembly recursively
+'===========================================================
+
+Imports System.IO
+Imports Inventor
+
+Sub Main()
+
+    '-----------------------------------------
+    ' Check that the active document is an assembly
+    '-----------------------------------------
+
+    Dim asmDoc As AssemblyDocument
+
+    Try
+        asmDoc = ThisApplication.ActiveDocument
+    Catch
+        MessageBox.Show("Unable to access the active document.", "Assembly Scanner")
+        Exit Sub
+    End Try
+
+    If asmDoc.DocumentType <> DocumentTypeEnum.kAssemblyDocumentObject Then
+        MessageBox.Show( _
+            "The active document is not an assembly.", _
+            "Assembly Scanner")
+        Exit Sub
+    End If
+
+    '-----------------------------------------
+    ' Start scanning
+    '-----------------------------------------
+
+    Dim report As String = ""
+
+    report = report & "ASSEMBLY SCAN" & vbCrLf
+    report = report & "============================" & vbCrLf
+    report = report & "Assembly: " & asmDoc.DisplayName & vbCrLf
+    report = report & vbCrLf
+
+    Dim topLevel As ComponentOccurrences
+
+    topLevel = asmDoc.ComponentDefinition.Occurrences
+
+    Dim componentCount As Integer = 0
+
+    For Each occurrence As ComponentOccurrence In topLevel
+
+        ScanOccurrence( _
+            occurrence, _
+            0, _
+            report, _
+            componentCount)
+
+    Next
+
+    '-----------------------------------------
+    ' Show results
+    '-----------------------------------------
+
+    report = report & vbCrLf
+    report = report & "============================" & vbCrLf
+    report = report & "Components found: " & componentCount
+
+    MessageBox.Show(report, "Assembly Scanner")
+
+End Sub
+
+
+'===========================================================
+' Recursive component scanner
+'===========================================================
+
+Sub ScanOccurrence( _
+    occurrence As ComponentOccurrence, _
+    level As Integer, _
+    ByRef report As String, _
+    ByRef componentCount As Integer)
+
+    componentCount = componentCount + 1
+
+    'Indent based on assembly depth
+    Dim indent As String = ""
+
+    For i As Integer = 1 To level
+        indent = indent & "    "
+    Next
+
+    '-----------------------------------------
+    ' Basic occurrence information
+    '-----------------------------------------
+
+    report = report & _
+        indent & "├─ " & occurrence.Name & vbCrLf
+
+    report = report & _
+        indent & "│  File: " & GetFileName(occurrence) & vbCrLf
+
+    report = report & _
+        indent & "│  Type: " & GetDocumentType(occurrence) & vbCrLf
+
+    '-----------------------------------------
+    ' Check if this is a part
+    '-----------------------------------------
+
+    If occurrence.DefinitionDocumentType = _
+        DocumentTypeEnum.kPartDocumentObject Then
+
+        Dim partDoc As PartDocument
+
+        Try
+
+            partDoc = occurrence.Definition.Document
+
+            report = report & _
+                indent & "│  Part detected" & vbCrLf
+
+            'Check for sheet metal
+            If partDoc.SubType = _
+                "{9C6D8F8E-1A4E-11D3-BE70-0060B0E6D4F5}" Then
+
+                report = report & _
+                    indent & "│  SHEET METAL: YES" & vbCrLf
+
+            Else
+
+                report = report & _
+                    indent & "│  SHEET METAL: NO" & vbCrLf
+
+            End If
+
+        Catch
+
+            report = report & _
+                indent & "│  Unable to inspect part" & vbCrLf
+
+        End Try
+
+    End If
+
+    '-----------------------------------------
+    ' If this is a subassembly,
+    ' scan its children
+    '-----------------------------------------
+
+    If occurrence.DefinitionDocumentType = _
+        DocumentTypeEnum.kAssemblyDocumentObject Then
+
+        Try
+
+            Dim subOccurrences As ComponentOccurrences
+
+            subOccurrences = occurrence.SubOccurrences
+
+            For Each child As ComponentOccurrence _
+                In subOccurrences
+
+                ScanOccurrence( _
+                    child, _
+                    level + 1, _
+                    report, _
+                    componentCount)
+
+            Next
+
+        Catch
+
+            report = report & _
+                indent & "│  Unable to scan subassembly" & vbCrLf
+
+        End Try
+
+    End If
+
+End Sub
+
+
+'===========================================================
+' Get filename
+'===========================================================
+
+Function GetFileName( _
+    occurrence As ComponentOccurrence) As String
+
+    Try
+
+        Return Path.GetFileName( _
+            occurrence.Definition.Document.FullFileName)
+
+    Catch
+
+        Return "(unresolved)"
+
+    End Try
+
+End Function
+
+
+'===========================================================
+' Get document type
+'===========================================================
+
+Function GetDocumentType( _
+    occurrence As ComponentOccurrence) As String
+
+    Try
+
+        Select Case occurrence.DefinitionDocumentType
+
+            Case DocumentTypeEnum.kPartDocumentObject
+                Return "PART"
+
+            Case DocumentTypeEnum.kAssemblyDocumentObject
+                Return "ASSEMBLY"
+
+            Case DocumentTypeEnum.kDrawingDocumentObject
+                Return "DRAWING"
+
+            Case Else
+                Return "OTHER"
+
+        End Select
+
+    Catch
+
+        Return "UNKNOWN"
+
+    End Try
+
+End Function
