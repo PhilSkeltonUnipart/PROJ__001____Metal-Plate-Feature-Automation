@@ -1273,11 +1273,67 @@ Class Logger
             DateTime.Now.ToString("HH:mm:ss")
 
 
+        ' --------------------------------------------------------
+        ' ALIGN LOG MESSAGE CONTENT
+        '
+        ' Keep the severity labels in a fixed-width column so that
+        ' the actual log message always starts at the same position.
+        '
+        ' Three spaces are added after the longest severity label
+        ' ([SUCCESS] / [WARNING]) to give the log a little more
+        ' separation between the identifier and the message.
+        ' --------------------------------------------------------
+
+        Dim FormattedMessage As String = Message
+
+
+		If Message.StartsWith("[INFO]") Then
+		
+		    FormattedMessage = _
+		        "[INFO]" & _
+		        Message.Substring(6).TrimStart().PadLeft( _
+		            Message.Substring(6).TrimStart().Length + 11)
+		
+		
+		ElseIf Message.StartsWith("[SUCCESS]") Then
+		
+		    FormattedMessage = _
+		        "[SUCCESS]" & _
+		        Message.Substring(9).TrimStart().PadLeft( _
+		            Message.Substring(9).TrimStart().Length + 5)
+		
+		
+		ElseIf Message.StartsWith("[WARNING]") Then
+		
+		    FormattedMessage = _
+		        "[WARNING]" & _
+		        Message.Substring(9).TrimStart().PadLeft( _
+		            Message.Substring(9).TrimStart().Length + 3)
+		
+		
+		ElseIf Message.StartsWith("[ERROR]") Then
+		
+		    FormattedMessage = _
+		        "[ERROR]" & _
+		        Message.Substring(7).TrimStart().PadLeft( _
+		            Message.Substring(7).TrimStart().Length + 10)
+		
+		
+		ElseIf Message.StartsWith("[DEBUG]") Then
+		
+		    FormattedMessage = _
+		        "[DEBUG]" & _
+		        Message.Substring(7).TrimStart().PadLeft( _
+		            Message.Substring(7).TrimStart().Length + 8)
+		
+		End If
+
+
         LogLines.Add( _
             "[" & _
             TimeStamp & _
             "] " & _
-            Message)
+            FormattedMessage)
 
 
     End Sub
