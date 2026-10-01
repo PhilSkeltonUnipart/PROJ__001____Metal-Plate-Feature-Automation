@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner
 '
-' Version: 0.2
+' Version: 0.3
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -12,8 +12,8 @@
 '   - Validate part naming
 '   - Identify PL components
 '   - Identify sheet metal parts
-'   - Read sheet metal thickness
-'   - Measure physical geometry thickness
+'   - Measure physical plate thickness from geometry
+'   - Warn only if sheet-metal parameter thickness differs
 '   - Produce a centralised diagnostic log
 '
 ' ============================================================
@@ -31,11 +31,8 @@ Sub Main()
 
     Dim PlateComponentType As String = "PL"
 
-    Dim DebugLogging As Boolean = True
-
-    ' Difference between the Inventor sheet-metal parameter
-    ' and the measured geometry which will generate a warning.
-
+    ' Difference allowed between physical and sheet-metal
+    ' parameter thickness before a warning is generated.
     Dim ThicknessWarningToleranceMM As Double = 0.1
 
 
@@ -140,31 +137,25 @@ Sub Main()
             Logger.Success( _
                 "Assembly naming convention: PASS")
 
-
             Logger.Info( _
                 "Project: " & _
                 AssemblyData.ProjectNumber)
-
 
             Logger.Info( _
                 "Description: " & _
                 AssemblyData.Description)
 
-
             Logger.Info( _
                 "Assembly type: " & _
                 AssemblyData.AssemblyType)
-
 
             Logger.Info( _
                 "Assembly number: " & _
                 AssemblyData.AssemblyNumber)
 
-
             Logger.Info( _
                 "Revision: " & _
                 AssemblyData.Revision)
-
 
         Else
 
@@ -203,7 +194,6 @@ Sub Main()
         ScanOccurrences( _
             AssemblyDoc.ComponentDefinition.Occurrences, _
             PlateComponentType, _
-            DebugLogging, _
             ThicknessWarningToleranceMM, _
             TotalOccurrences, _
             TotalParts, _
@@ -276,14 +266,11 @@ Sub Main()
         Logger.Error( _
             "UNEXPECTED ERROR")
 
-
         Logger.Error( _
             ex.Message)
 
-
         Logger.Debug( _
             ex.StackTrace)
-
 
     End Try
 
@@ -298,6 +285,7 @@ Sub Main()
 End Sub
 
 
+
 ' ============================================================
 ' RECURSIVE ASSEMBLY SCANNER
 ' ============================================================
@@ -305,7 +293,6 @@ End Sub
 Sub ScanOccurrences( _
     Occurrences As Inventor.ComponentOccurrences, _
     PlateComponentType As String, _
-    DebugLogging As Boolean, _
     ThicknessWarningToleranceMM As Double, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
@@ -390,32 +377,6 @@ Sub ScanOccurrences( _
                 Logger.Success( _
                     "Naming convention: PASS")
 
-
-                Logger.Debug( _
-                    "Project: " & _
-                    SubAssemblyData.ProjectNumber)
-
-
-                Logger.Debug( _
-                    "Description: " & _
-                    SubAssemblyData.Description)
-
-
-                Logger.Debug( _
-                    "Type: " & _
-                    SubAssemblyData.AssemblyType)
-
-
-                Logger.Debug( _
-                    "Number: " & _
-                    SubAssemblyData.AssemblyNumber)
-
-
-                Logger.Debug( _
-                    "Revision: " & _
-                    SubAssemblyData.Revision)
-
-
             Else
 
                 Logger.Warning( _
@@ -431,7 +392,6 @@ Sub ScanOccurrences( _
             ScanOccurrences( _
                 SubAssemblyDoc.ComponentDefinition.Occurrences, _
                 PlateComponentType, _
-                DebugLogging, _
                 ThicknessWarningToleranceMM, _
                 TotalOccurrences, _
                 TotalParts, _
@@ -495,10 +455,8 @@ Sub ScanOccurrences( _
             Logger.Warning( _
                 "Part naming convention: FAIL")
 
-
             Logger.Warning( _
                 "Unable to determine component type.")
-
 
             Continue For
 
@@ -507,31 +465,6 @@ Sub ScanOccurrences( _
 
         Logger.Success( _
             "Part naming convention: PASS")
-
-
-        Logger.Debug( _
-            "Project: " & _
-            PartData.ProjectNumber)
-
-
-        Logger.Debug( _
-            "Project ID: " & _
-            PartData.ProjectIdentifier)
-
-
-        Logger.Debug( _
-            "Component type: " & _
-            PartData.ComponentType)
-
-
-        Logger.Debug( _
-            "Component number: " & _
-            PartData.ComponentNumber)
-
-
-        Logger.Debug( _
-            "Revision: " & _
-            PartData.Revision)
 
 
         ' ====================================================
@@ -546,7 +479,6 @@ Sub ScanOccurrences( _
                 "Component type is not " & _
                 PlateComponentType & _
                 " - ignored.")
-
 
             Continue For
 
@@ -576,16 +508,13 @@ Sub ScanOccurrences( _
             Logger.Success( _
                 "Sheet metal check: PASS")
 
-
         Else
 
             Logger.Warning( _
                 "Sheet metal check: FAIL")
 
-
             Logger.Warning( _
                 "PL component is not recognised as sheet metal.")
-
 
             Continue For
 
@@ -593,152 +522,78 @@ Sub ScanOccurrences( _
 
 
         ' ====================================================
-        ' PHYSICAL PLATE THICKNESS
+        ' PHYSICAL THICKNESS
+        '
+        ' The thickness displayed here comes from the physical
+        ' geometry, NOT the sheet-metal parameter.
+        '
+        ' The sheet-metal parameter is only checked internally
+        ' so that a warning can be generated if it disagrees.
         ' ====================================================
-
-        Logger.Section("PLATE THICKNESS ANALYSIS")
-
-
-        Dim ParameterThicknessMM As Double = 0
-
-        Dim GeometricThicknessMM As Double = 0
 
         Dim PhysicalThicknessMM As Double = 0
 
-        Dim ThicknessSource As String = ""
+        Dim ParameterThicknessMM As Double = 0
 
 
         PhysicalThicknessMM = _
             GetPhysicalPlateThicknessMM( _
                 PartDoc, _
-                ParameterThicknessMM, _
-                GeometricThicknessMM, _
-                ThicknessSource)
+                ParameterThicknessMM)
 
-
-        ' ----------------------------------------------------
-        ' REPORT SHEET METAL PARAMETER
-        ' ----------------------------------------------------
-
-        If ParameterThicknessMM > 0 Then
-
-            Logger.Info( _
-                "Sheet-metal parameter thickness: " & _
-                Math.Round( _
-                    ParameterThicknessMM, _
-                    3) & _
-                " mm")
-
-        Else
-
-            Logger.Warning( _
-                "Sheet-metal parameter thickness unavailable.")
-
-        End If
-
-
-        ' ----------------------------------------------------
-        ' REPORT GEOMETRIC THICKNESS
-        ' ----------------------------------------------------
-
-        If GeometricThicknessMM > 0 Then
-
-            Logger.Info( _
-                "Measured geometric thickness: " & _
-                Math.Round( _
-                    GeometricThicknessMM, _
-                    3) & _
-                " mm")
-
-        Else
-
-            Logger.Warning( _
-                "Geometric thickness could not be measured.")
-
-        End If
-
-
-        ' ----------------------------------------------------
-        ' REPORT SELECTED THICKNESS
-        ' ----------------------------------------------------
 
         If PhysicalThicknessMM > 0 Then
 
-            Logger.Success( _
-                "Thickness used by automation: " & _
+
+            ' ------------------------------------------------
+            ' PHYSICAL THICKNESS
+            ' ------------------------------------------------
+
+            Logger.Info( _
+                "Physical thickness: " & _
                 Math.Round( _
                     PhysicalThicknessMM, _
                     3) & _
                 " mm")
 
 
-            Logger.Debug( _
-                "Thickness source: " & _
-                ThicknessSource)
+            ' ------------------------------------------------
+            ' PARAMETER DISCREPANCY WARNING
+            ' ------------------------------------------------
 
-        Else
+            If ParameterThicknessMM > 0 Then
 
-            Logger.Error( _
-                "Unable to determine physical plate thickness.")
-
-        End If
-
-
-        ' ----------------------------------------------------
-        ' CHECK FOR DISCREPANCY
-        ' ----------------------------------------------------
-
-        If ParameterThicknessMM > 0 And _
-           GeometricThicknessMM > 0 Then
+                Dim ThicknessDifferenceMM As Double = _
+                    Math.Abs( _
+                        PhysicalThicknessMM - _
+                        ParameterThicknessMM)
 
 
-            Dim ThicknessDifference As Double = _
-                Math.Abs( _
-                    ParameterThicknessMM - _
-                    GeometricThicknessMM)
+                If ThicknessDifferenceMM > _
+                    ThicknessWarningToleranceMM Then
 
+                    Logger.Warning( _
+                        "Sheet-metal parameter thickness is " & _
+                        Math.Round( _
+                            ParameterThicknessMM, _
+                            3) & _
+                        " mm; physical thickness is " & _
+                        Math.Round( _
+                            PhysicalThicknessMM, _
+                            3) & _
+                        " mm.")
 
-            If ThicknessDifference > _
-                ThicknessWarningToleranceMM Then
-
-
-                Logger.Warning( _
-                    "THICKNESS DISCREPANCY DETECTED")
-
-
-                Logger.Warning( _
-                    "Sheet-metal parameter = " & _
-                    Math.Round( _
-                        ParameterThicknessMM, _
-                        3) & _
-                    " mm")
-
-
-                Logger.Warning( _
-                    "Physical geometry = " & _
-                    Math.Round( _
-                        GeometricThicknessMM, _
-                        3) & _
-                    " mm")
-
-
-                Logger.Warning( _
-                    "Difference = " & _
-                    Math.Round( _
-                        ThicknessDifference, _
-                        3) & _
-                    " mm")
-
-
-            Else
-
-
-                Logger.Success( _
-                    "Sheet-metal parameter and geometry agree.")
-
+                End If
 
             End If
 
+
+        Else
+
+            Logger.Warning( _
+                "Physical plate thickness could not be determined.")
+
+            Continue For
 
         End If
 
@@ -777,6 +632,7 @@ Sub ScanOccurrences( _
 End Sub
 
 
+
 ' ============================================================
 ' SHEET METAL CHECK
 ' ============================================================
@@ -795,20 +651,16 @@ Function IsSheetMetalPart( _
         If TypeOf Definition Is _
             Inventor.SheetMetalComponentDefinition Then
 
-
             Return True
-
 
         End If
 
 
     Catch ex As Exception
 
-
         Logger.Debug( _
             "Sheet metal check failed: " & _
             ex.Message)
-
 
     End Try
 
@@ -819,43 +671,39 @@ Function IsSheetMetalPart( _
 End Function
 
 
+
 ' ============================================================
 ' GET PHYSICAL PLATE THICKNESS
 '
-' This function deliberately does NOT rely solely on the
-' SheetMetalComponentDefinition.Thickness parameter.
+' IMPORTANT:
 '
-' It obtains:
+' This function measures the physical geometry.
 '
-'   1. Sheet-metal parameter thickness
-'   2. Actual geometric minimum dimension
+' It does NOT use the sheet-metal thickness parameter as the
+' thickness returned to the automation.
 '
-' The geometric measurement is used as the physical thickness
-' for the automation when available.
+' The sheet-metal parameter is read only so that we can detect
+' and report discrepancies.
+'
+' Inventor's OrientedMinimumRangeBox provides the minimum
+' oriented dimensions of the component geometry.
 '
 ' ============================================================
 
 Function GetPhysicalPlateThicknessMM( _
     PartDoc As Inventor.PartDocument, _
-    ByRef ParameterThicknessMM As Double, _
-    ByRef GeometricThicknessMM As Double, _
-    ByRef ThicknessSource As String) As Double
+    ByRef ParameterThicknessMM As Double) As Double
 
 
     ParameterThicknessMM = 0
 
-    GeometricThicknessMM = 0
-
-    ThicknessSource = "Unavailable"
-
-
-    ' ========================================================
-    ' STEP 1
-    ' Get Inventor sheet-metal parameter thickness
-    ' ========================================================
 
     Try
 
+
+        ' ----------------------------------------------------
+        ' GET SHEET METAL DEFINITION
+        ' ----------------------------------------------------
 
         Dim SheetMetalDef As _
             Inventor.SheetMetalComponentDefinition = _
@@ -864,51 +712,28 @@ Function GetPhysicalPlateThicknessMM( _
                 Inventor.SheetMetalComponentDefinition)
 
 
-        ' Inventor database length units are cm.
+        ' ----------------------------------------------------
+        ' READ PARAMETER ONLY FOR COMPARISON
+        ' ----------------------------------------------------
 
-        ParameterThicknessMM = _
-            SheetMetalDef.Thickness.Value * 10
+        Try
+
+            ParameterThicknessMM = _
+                PartDoc.UnitsOfMeasure.ConvertUnits( _
+                    SheetMetalDef.Thickness.Value, _
+                    "cm", _
+                    "mm")
+
+        Catch
+
+            ParameterThicknessMM = 0
+
+        End Try
 
 
         ' ----------------------------------------------------
-        ' Report whether thickness comes from the sheet-metal
-        ' style or is explicitly overridden.
+        ' GET PHYSICAL GEOMETRY
         ' ----------------------------------------------------
-
-        If SheetMetalDef.UseSheetMetalStyleThickness Then
-
-            Logger.Debug( _
-                "Sheet-metal thickness is controlled by active style.")
-
-        Else
-
-            Logger.Debug( _
-                "Sheet-metal thickness is explicitly overridden.")
-
-        End If
-
-
-    Catch ex As Exception
-
-
-        Logger.Warning( _
-            "Could not read sheet-metal parameter thickness.")
-
-
-        Logger.Debug( _
-            ex.Message)
-
-
-    End Try
-
-
-    ' ========================================================
-    ' STEP 2
-    ' Measure actual geometry
-    ' ========================================================
-
-    Try
-
 
         Dim PartDef As Inventor.PartComponentDefinition = _
             CType( _
@@ -916,67 +741,45 @@ Function GetPhysicalPlateThicknessMM( _
                 Inventor.PartComponentDefinition)
 
 
-        ' ----------------------------------------------------
-        ' Get oriented minimum range box.
-        '
-        ' This is independent of the part's orientation in
-        ' the assembly.
-        ' ----------------------------------------------------
-
         Dim MinimumBox As Inventor.OrientedBox = _
             PartDef.OrientedMinimumRangeBox
 
 
         ' ----------------------------------------------------
-        ' Get the three physical bounding dimensions.
+        ' GET THE THREE PHYSICAL DIMENSIONS
         '
-        ' Inventor database units = cm.
-        ' Convert to mm by multiplying by 10.
+        ' Direction lengths are returned in Inventor's
+        ' database units (cm).
         ' ----------------------------------------------------
 
         Dim DimensionOneMM As Double = _
-            MinimumBox.DirectionOne.Length * 10
+            PartDoc.UnitsOfMeasure.ConvertUnits( _
+                MinimumBox.DirectionOne.Length, _
+                "cm", _
+                "mm")
 
 
         Dim DimensionTwoMM As Double = _
-            MinimumBox.DirectionTwo.Length * 10
+            PartDoc.UnitsOfMeasure.ConvertUnits( _
+                MinimumBox.DirectionTwo.Length, _
+                "cm", _
+                "mm")
 
 
         Dim DimensionThreeMM As Double = _
-            MinimumBox.DirectionThree.Length * 10
-
-
-        Logger.Debug( _
-            "Geometric dimension 1: " & _
-            Math.Round( _
-                DimensionOneMM, _
-                3) & _
-            " mm")
-
-
-        Logger.Debug( _
-            "Geometric dimension 2: " & _
-            Math.Round( _
-                DimensionTwoMM, _
-                3) & _
-            " mm")
-
-
-        Logger.Debug( _
-            "Geometric dimension 3: " & _
-            Math.Round( _
-                DimensionThreeMM, _
-                3) & _
-                " mm")
+            PartDoc.UnitsOfMeasure.ConvertUnits( _
+                MinimumBox.DirectionThree.Length, _
+                "cm", _
+                "mm")
 
 
         ' ----------------------------------------------------
-        ' Determine the smallest physical dimension.
+        ' SMALLEST PHYSICAL DIMENSION
         '
-        ' For a normal flat plate this is the plate thickness.
+        ' For a flat plate this is the material thickness.
         ' ----------------------------------------------------
 
-        GeometricThicknessMM = _
+        Dim PhysicalThicknessMM As Double = _
             Math.Min( _
                 DimensionOneMM, _
                 Math.Min( _
@@ -984,71 +787,32 @@ Function GetPhysicalPlateThicknessMM( _
                     DimensionThreeMM))
 
 
-        Logger.Debug( _
-            "Smallest geometric dimension: " & _
-            Math.Round( _
-                GeometricThicknessMM, _
-                3) & _
-            " mm")
+        If PhysicalThicknessMM <= 0 Then
+
+            Return 0
+
+        End If
+
+
+        Return PhysicalThicknessMM
 
 
     Catch ex As Exception
 
 
-        Logger.Warning( _
-            "Could not measure geometric plate thickness.")
-
-
         Logger.Debug( _
+            "Physical thickness measurement failed: " & _
             ex.Message)
+
+
+        Return 0
 
 
     End Try
 
 
-    ' ========================================================
-    ' STEP 3
-    ' Select physical thickness
-    ' ========================================================
-
-    If GeometricThicknessMM > 0 Then
-
-
-        PhysicalThicknessMM = _
-            GeometricThicknessMM
-
-
-        ThicknessSource = _
-            "Measured plate geometry"
-
-
-    ElseIf ParameterThicknessMM > 0 Then
-
-
-        PhysicalThicknessMM = _
-            ParameterThicknessMM
-
-
-        ThicknessSource = _
-            "Sheet-metal parameter (fallback)"
-
-
-    Else
-
-
-        PhysicalThicknessMM = 0
-
-        ThicknessSource = _
-            "No thickness available"
-
-
-    End If
-
-
-    Return PhysicalThicknessMM
-
-
 End Function
+
 
 
 ' ============================================================
@@ -1070,6 +834,7 @@ Class PartNameData
     Public Revision As String
 
 End Class
+
 
 
 ' ============================================================
@@ -1139,6 +904,7 @@ Function ParsePartName( _
 End Function
 
 
+
 ' ============================================================
 ' ASSEMBLY NAME DATA
 ' ============================================================
@@ -1160,6 +926,7 @@ Class AssemblyNameData
 End Class
 
 
+
 ' ============================================================
 ' PARSE ASSEMBLY NAME
 '
@@ -1170,7 +937,6 @@ End Class
 ' Examples:
 '
 ' 9187-DitchCrossingSlab-GA01-01
-'
 ' 9187-InternalStructure-SA01-01
 '
 ' ============================================================
@@ -1229,6 +995,7 @@ Function ParseAssemblyName( _
 End Function
 
 
+
 ' ============================================================
 ' DISPLAY LOG
 '
@@ -1264,6 +1031,10 @@ Sub ShowLog()
     LogForm.MinimizeBox = True
 
 
+    ' --------------------------------------------------------
+    ' LOG TEXT BOX
+    ' --------------------------------------------------------
+
     Dim LogBox As New System.Windows.Forms.TextBox
 
 
@@ -1286,6 +1057,10 @@ Sub ShowLog()
     LogBox.Text = LogText
 
 
+    ' --------------------------------------------------------
+    ' CLOSE BUTTON
+    ' --------------------------------------------------------
+
     Dim CloseButton As _
         New System.Windows.Forms.Button
 
@@ -1306,15 +1081,27 @@ Sub ShowLog()
         System.Windows.Forms.DialogResult.OK
 
 
+    ' --------------------------------------------------------
+    ' ADD CONTROLS
+    ' --------------------------------------------------------
+
     LogForm.Controls.Add(LogBox)
 
     LogForm.Controls.Add(CloseButton)
 
 
+    ' --------------------------------------------------------
+    ' BUTTON BEHAVIOUR
+    ' --------------------------------------------------------
+
     LogForm.AcceptButton = CloseButton
 
     LogForm.CancelButton = CloseButton
 
+
+    ' --------------------------------------------------------
+    ' DISPLAY
+    ' --------------------------------------------------------
 
     LogForm.ShowDialog()
 
@@ -1322,8 +1109,12 @@ Sub ShowLog()
 End Sub
 
 
+
 ' ============================================================
 ' LOGGER
+'
+' Central logging system for the entire automation.
+'
 ' ============================================================
 
 Class Logger
