@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.3
+' Version: 0.4.4
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -665,6 +665,7 @@ Sub ScanOccurrences( _
             PartDoc,
             Occurrence.Name,
             NibProfile,
+            PhysicalThicknessMM,
             MinimumNibEdgeLengthMM,
             MinimumNibEndClearanceMM,
             MaximumNibSpacingMM)
@@ -679,24 +680,27 @@ End Sub
 
 
 
-' ============================================================
+ ' ============================================================
 ' NIB EDGE ANALYSIS - REPORT ONLY
 '
-' Strategy:
-'   - Inspect the largest planar face on each solid body.
-'   - Use its boundary loops to distinguish outer perimeter from
-'     internal openings.
-'   - Consider straight edges only in this first analyser version.
-'   - Calculate evenly distributed candidate positions; do not
-'     create geometry, occurrences, constraints or transactions.
+' Version 0.4.4 geometry strategy:
+'   - Identify the broad planar face, not merely any planar face.
+'   - Rank planar faces first by how many boundary edges are much
+'     longer than the measured sheet thickness, then by face area.
+'   - Analyse only boundary loops belonging to that broad face.
+'   - Reject edges whose length is consistent with sheet thickness.
+'   - Apply the selected nib profile after geometric classification.
+'   - Calculate positions only; never insert nibs or modify assembly.
 '
-' Note: complex formed/split-face parts may need later refinement.
+' This is intended to handle rotated plates and angled outlines because
+' it does not depend on global X/Y/Z directions or rectangular shapes.
 ' ============================================================
 
 Sub AnalyzePlateGeometry( _
     PartDoc As Inventor.PartDocument, _
     OccurrenceName As String, _
     NibProfile As String, _
+    PhysicalThicknessMM As Double, _
     MinimumNibEdgeLengthMM As Double, _
     MinimumNibEndClearanceMM As Double, _
     MaximumNibSpacingMM As Double)
@@ -705,6 +709,8 @@ Sub AnalyzePlateGeometry( _
     Logger.Info("Occurrence: " & OccurrenceName)
     Logger.Info("Part file: " & System.IO.Path.GetFileNameWithoutExtension(PartDoc.FullFileName))
     Logger.Info("Selected profile: " & NibProfile)
+    Logger.Info("Measured physical thickness supplied to analyser: " & _
+                Math.Round(PhysicalThicknessMM, 3) & " mm")
 
     Dim PartDef As Inventor.PartComponentDefinition = Nothing
     Try
@@ -736,55 +742,60 @@ Sub AnalyzePlateGeometry( _
             Continue For
         End If
 
-        ' Sheet-metal parts are represented by solid B-rep bodies in Inventor.
-        ' Try both SurfaceType and the underlying geometry type because API
-        ' wrappers can expose these differently for some imported/derived parts.
+        ' Find the broad planar face. A side face on a 3 mm plate can have
+        ' two 1000 mm edges and two 3 mm edges. Ranking only by area can be
+        ' unreliable for imported/derived geometry, so the number of long
+        ' boundary edges is the primary score and area breaks ties.
         Dim MainFace As Inventor.Face = Nothing
-        Dim LargestPlanarFaceArea As Double = -1
-        Dim LargestAnyFace As Inventor.Face = Nothing
-        Dim LargestAnyFaceArea As Double = -1
+        Dim BestLongBoundaryEdgeCount As Integer = -1
+        Dim BestFaceArea As Double = -1
         Dim PlanarFacesFound As Integer = 0
         Dim FaceIndex As Integer = 0
+        Dim ThicknessScaleThresholdMM As Double = Math.Max(PhysicalThicknessMM * 2.0, 1.0)
 
         For Each Face As Inventor.Face In Body.Faces
             FaceIndex += 1
             If Face Is Nothing Then Continue For
+            If Not IsPlanarFaceForAnalysis(Face) Then Continue For
 
+            PlanarFacesFound += 1
             Dim FaceArea As Double = TryGetFaceArea(Face)
-            If FaceArea > LargestAnyFaceArea Then
-                LargestAnyFaceArea = FaceArea
-                LargestAnyFace = Face
-            End If
+            Dim LongBoundaryEdgeCount As Integer = CountLongBoundaryEdges( _
+                PartDoc, Face, ThicknessScaleThresholdMM)
 
-            If IsPlanarFaceForAnalysis(Face) Then
-                PlanarFacesFound += 1
-                If FaceArea > LargestPlanarFaceArea Then
-                    LargestPlanarFaceArea = FaceArea
-                    MainFace = Face
-                End If
+            Logger.Debug("Body " & BodyIndex & ", face " & FaceIndex & _
+                         ": planar area=" & Math.Round(FaceArea, 3) & _
+                         "; boundary edges longer than " & _
+                         Math.Round(ThicknessScaleThresholdMM, 3) & " mm=" & _
+                         LongBoundaryEdgeCount)
+
+            If LongBoundaryEdgeCount > BestLongBoundaryEdgeCount OrElse _
+               (LongBoundaryEdgeCount = BestLongBoundaryEdgeCount AndAlso FaceArea > BestFaceArea) Then
+                MainFace = Face
+                BestLongBoundaryEdgeCount = LongBoundaryEdgeCount
+                BestFaceArea = FaceArea
             End If
         Next
 
         Logger.Info("Body " & BodyIndex & ": planar faces recognised=" & PlanarFacesFound)
 
-        ' Fallback: if the plane test failed for this model, use the largest
-        ' face as a diagnostic fallback instead of silently returning zero edges.
-        ' The log explicitly flags this so the results can be checked carefully.
-        If MainFace Is Nothing AndAlso LargestAnyFace IsNot Nothing Then
-            MainFace = LargestAnyFace
-            Logger.Warning("No planar face was recognised on body " & BodyIndex & _
-                           "; analysing its largest-area face as a FALLBACK. Verify candidates before relying on them.")
-        End If
-
         If MainFace Is Nothing Then
-            Logger.Warning("No usable face found on body " & BodyIndex & "; body skipped.")
+            Logger.Warning("No planar face found on body " & BodyIndex & "; body skipped. " & _
+                           "No fallback to a non-planar/side face was used, to avoid false edge candidates.")
             Continue For
         End If
 
+        If BestLongBoundaryEdgeCount < 3 Then
+            Logger.Warning("Selected face on body " & BodyIndex & " has only " & _
+                           BestLongBoundaryEdgeCount & " boundary edges longer than the thickness threshold. " & _
+                           "The geometry may not expose a clear broad plate face; results require review.")
+        End If
+
         BodiesAnalysed += 1
-        Logger.Info("Analysing selected face on body " & BodyIndex & _
-                    "; area=" & Math.Round(Math.Max(0, LargestPlanarFaceArea), 3) & " database units squared" & _
-                    "; edge loops=" & MainFace.EdgeLoops.Count)
+        Logger.Info("Selected broad planar face on body " & BodyIndex & _
+                    "; area=" & Math.Round(Math.Max(0, BestFaceArea), 3) & _
+                    " database units squared; long boundary edges=" & _
+                    BestLongBoundaryEdgeCount & "; edge loops=" & MainFace.EdgeLoops.Count)
 
         For Each BoundaryLoop As Inventor.EdgeLoop In MainFace.EdgeLoops
             LoopsAnalysed += 1
@@ -826,12 +837,20 @@ Sub AnalyzePlateGeometry( _
 
                 Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
                 Dim IsStraight As Boolean = IsStraightEdge(Edge)
+                Dim IsThicknessScaleEdge As Boolean = False
+                If PhysicalThicknessMM > 0 AndAlso IsStraight Then
+                    IsThicknessScaleEdge = (EdgeLengthMM <= PhysicalThicknessMM * 1.5)
+                End If
+
                 Dim IsCandidate As Boolean = IncludeLoop
                 Dim Reason As String = "Boundary permitted by selected profile"
 
                 If Not IsStraight Then
                     IsCandidate = False
                     Reason = "Curved edge not supported by initial analyser"
+                ElseIf IsThicknessScaleEdge Then
+                    IsCandidate = False
+                    Reason = "Edge length is consistent with plate thickness; not a nibbing boundary"
                 ElseIf Not IncludeLoop Then
                     IsCandidate = False
                     Reason = "Boundary excluded by selected profile"
@@ -850,6 +869,7 @@ Sub AnalyzePlateGeometry( _
                 Logger.Info("Edge " & EdgesAnalysed & _
                             " | Type=" & If(IsStraight, "Straight", "Curved/other") & _
                             " | Length=" & Math.Round(EdgeLengthMM, 2) & " mm" & _
+                            " | Geometry=BOUNDARY OF SELECTED PLANAR FACE" & _
                             " | " & If(IsCandidate, "CANDIDATE", "REJECTED") & _
                             " | " & Reason)
 
@@ -887,6 +907,32 @@ Sub AnalyzePlateGeometry( _
 End Sub
 
 
+Function CountLongBoundaryEdges( _
+    PartDoc As Inventor.PartDocument, _
+    Face As Inventor.Face, _
+    MinimumLongEdgeLengthMM As Double) As Integer
+
+    Dim Count As Integer = 0
+    If PartDoc Is Nothing OrElse Face Is Nothing Then Return Count
+
+    Try
+        For Each BoundaryLoop As Inventor.EdgeLoop In Face.EdgeLoops
+            For Each Edge As Inventor.Edge In BoundaryLoop.Edges
+                If IsStraightEdge(Edge) Then
+                    If GetStraightEdgeLengthMM(PartDoc, Edge) > MinimumLongEdgeLengthMM Then
+                        Count += 1
+                    End If
+                End If
+            Next
+        Next
+    Catch ex As Exception
+        Logger.Debug("Unable to score planar face boundary edges: " & ex.Message)
+    End Try
+
+    Return Count
+End Function
+
+
 Function IsPlanarFaceForAnalysis(Face As Inventor.Face) As Boolean
     If Face Is Nothing Then Return False
 
@@ -903,7 +949,7 @@ Function IsPlanarFaceForAnalysis(Face As Inventor.Face) As Boolean
             Return True
         End If
     Catch
-        ' Geometry type is not exposed as a Plane; caller can use fallback.
+        ' Geometry type is not exposed as a Plane.
     End Try
 
     Return False
@@ -921,9 +967,6 @@ End Function
 
 ' ------------------------------------------------------------
 ' EDGE GEOMETRY HELPERS
-' These were inadvertently omitted when the face-detection
-' helpers were added in v0.4.2. Keep these functions in the
-' same rule so edge classification and length measurement compile.
 ' ------------------------------------------------------------
 
 Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
