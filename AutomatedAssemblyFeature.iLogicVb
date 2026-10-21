@@ -1,9 +1,9 @@
 ' ============================================================
 ' INVENTOR NIB AUTOMATION
 '
-' Assembly / Plate Scanner
+' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.3
+' Version: 0.4
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -14,7 +14,11 @@
 '   - Identify sheet metal parts
 '   - Measure physical plate thickness from geometry
 '   - Warn only if sheet-metal parameter thickness differs
+'   - Analyse internal openings and/or external boundaries using a selected profile
+'   - Calculate evenly distributed candidate nib positions (report only)
 '   - Produce a centralised diagnostic log
+'
+' IMPORTANT: This version does NOT insert nibs or modify the assembly.
 '
 ' ============================================================
 
@@ -35,6 +39,19 @@ Sub Main()
     ' parameter thickness before a warning is generated.
     Dim ThicknessWarningToleranceMM As Double = 0.1
 
+    ' Nib analysis settings. These are initial test values and
+    ' should be confirmed against the engineering standard.
+    Dim MinimumNibEdgeLengthMM As Double = 150.0
+    Dim MinimumNibEndClearanceMM As Double = 75.0
+    Dim MaximumNibSpacingMM As Double = 300.0
+
+    ' Ask for one profile per run. No individual edge selection
+    ' is required; geometry detection is automatic.
+    Dim NibProfiles As String() = { _
+        "Internal openings - all suitable edges", _
+        "Internal openings - long edges only", _
+        "Internal openings + external perimeter", _
+        "External perimeter only"}
 
     ' --------------------------------------------------------
     ' START LOGGER
@@ -109,6 +126,20 @@ Sub Main()
             CType( _
                 ActiveDoc, _
                 Inventor.AssemblyDocument)
+
+
+        ' Ask for one profile per run, after confirming that an
+        ' assembly is active. No individual edge selection is needed.
+        Dim NibProfile As String = InputListBox( _
+            "Choose the nibbing profile for this analysis run.", _
+            NibProfiles, _
+            NibProfiles(0), _
+            "Inventor Nib Automation - Profile", _
+            "Nibbing profiles")
+
+        If String.IsNullOrWhiteSpace(NibProfile) Then
+            NibProfile = NibProfiles(0)
+        End If
 
 
         ' ----------------------------------------------------
@@ -190,11 +221,20 @@ Sub Main()
 
         Logger.Section("SCANNING COMPONENTS")
 
+        Logger.Info("Nibbing profile: " & NibProfile)
+        Logger.Info("Minimum candidate edge length: " & MinimumNibEdgeLengthMM & " mm")
+        Logger.Info("Minimum end clearance: " & MinimumNibEndClearanceMM & " mm")
+        Logger.Info("Maximum nib spacing: " & MaximumNibSpacingMM & " mm")
+        Logger.Warning("Analysis-only mode: no nibs will be inserted and no geometry will be changed.")
 
         ScanOccurrences( _
             AssemblyDoc.ComponentDefinition.Occurrences, _
             PlateComponentType, _
             ThicknessWarningToleranceMM, _
+            NibProfile, _
+            MinimumNibEdgeLengthMM, _
+            MinimumNibEndClearanceMM, _
+            MaximumNibSpacingMM, _
             TotalOccurrences, _
             TotalParts, _
             SheetMetalParts, _
@@ -294,6 +334,10 @@ Sub ScanOccurrences( _
     Occurrences As Inventor.ComponentOccurrences, _
     PlateComponentType As String, _
     ThicknessWarningToleranceMM As Double, _
+    NibProfile As String, _
+    MinimumNibEdgeLengthMM As Double, _
+    MinimumNibEndClearanceMM As Double, _
+    MaximumNibSpacingMM As Double, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
     ByRef SheetMetalParts As Integer, _
@@ -393,6 +437,10 @@ Sub ScanOccurrences( _
                 SubAssemblyDoc.ComponentDefinition.Occurrences, _
                 PlateComponentType, _
                 ThicknessWarningToleranceMM, _
+                NibProfile, _
+                MinimumNibEdgeLengthMM, _
+                MinimumNibEndClearanceMM, _
+                MaximumNibSpacingMM, _
                 TotalOccurrences, _
                 TotalParts, _
                 SheetMetalParts, _
@@ -610,20 +658,18 @@ Sub ScanOccurrences( _
 
 
         ' ====================================================
-        ' FUTURE GEOMETRY PROCESSING
+        ' NIB EDGE ANALYSIS (REPORT ONLY)
         ' ====================================================
-        '
-        ' DetectPlateEdges()
-        '
-        ' DetectCorners()
-        '
-        ' FindCandidateNibLocations()
-        '
-        ' SelectNib()
-        '
-        ' InsertNib()
-        '
-        ' ====================================================
+
+        AnalyzePlateGeometry( _
+            PartDoc,
+            Occurrence.Name,
+            NibProfile,
+            MinimumNibEdgeLengthMM,
+            MinimumNibEndClearanceMM,
+            MaximumNibSpacingMM)
+
+        ' Nib selection and insertion are intentionally not called.
 
 
     Next
@@ -631,6 +677,203 @@ Sub ScanOccurrences( _
 
 End Sub
 
+
+
+' ============================================================
+' NIB EDGE ANALYSIS - REPORT ONLY
+'
+' Strategy:
+'   - Inspect the largest planar face on each solid body.
+'   - Use its boundary loops to distinguish outer perimeter from
+'     internal openings.
+'   - Consider straight edges only in this first analyser version.
+'   - Calculate evenly distributed candidate positions; do not
+'     create geometry, occurrences, constraints or transactions.
+'
+' Note: complex formed/split-face parts may need later refinement.
+' ============================================================
+
+Sub AnalyzePlateGeometry( _
+    PartDoc As Inventor.PartDocument, _
+    OccurrenceName As String, _
+    NibProfile As String, _
+    MinimumNibEdgeLengthMM As Double, _
+    MinimumNibEndClearanceMM As Double, _
+    MaximumNibSpacingMM As Double)
+
+    Logger.Section("NIB EDGE ANALYSIS")
+    Logger.Info("Occurrence: " & OccurrenceName)
+    Logger.Info("Part file: " & System.IO.Path.GetFileNameWithoutExtension(PartDoc.FullFileName))
+
+    Dim PartDef As Inventor.PartComponentDefinition = Nothing
+    Try
+        PartDef = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition)
+    Catch ex As Exception
+        Logger.Warning("Geometry analysis skipped: unable to access part definition. " & ex.Message)
+        Exit Sub
+    End Try
+
+    Dim BodiesAnalysed As Integer = 0
+    Dim LoopsAnalysed As Integer = 0
+    Dim EdgesAnalysed As Integer = 0
+    Dim CandidateEdges As Integer = 0
+    Dim RejectedEdges As Integer = 0
+    Dim CandidatePositions As Integer = 0
+
+    For Each Body As Inventor.SurfaceBody In PartDef.SurfaceBodies
+        If Body Is Nothing Then Continue For
+        If Not Body.IsSolid Then Continue For
+
+        ' Pick the largest planar face as the principal plate face.
+        ' This avoids analysing both broad sides of a flat plate.
+        Dim MainFace As Inventor.Face = Nothing
+        Dim LargestFaceArea As Double = 0
+
+        For Each Face As Inventor.Face In Body.Faces
+            Try
+                If Face.SurfaceType = Inventor.SurfaceTypeEnum.kPlaneSurface Then
+                    If Face.Area > LargestFaceArea Then
+                        LargestFaceArea = Face.Area
+                        MainFace = Face
+                    End If
+                End If
+            Catch
+                ' Ignore faces whose area/type cannot be read.
+            End Try
+        Next
+
+        If MainFace Is Nothing Then
+            Logger.Warning("No planar face found on a solid body; body skipped.")
+            Continue For
+        End If
+
+        BodiesAnalysed += 1
+        Logger.Info("Analysing principal planar face on solid body " & BodiesAnalysed)
+
+        For Each Loop As Inventor.EdgeLoop In MainFace.EdgeLoops
+            LoopsAnalysed += 1
+
+            Dim IsOuterLoop As Boolean = False
+            Try
+                IsOuterLoop = Loop.IsOuterEdgeLoop
+            Catch
+                Logger.Warning("Unable to classify a boundary loop; loop skipped.")
+                Continue For
+            End Try
+
+            Dim LoopType As String = If(IsOuterLoop, "EXTERNAL PERIMETER", "INTERNAL OPENING")
+            Dim IncludeLoop As Boolean = False
+
+            Select Case NibProfile
+                Case "Internal openings - all suitable edges", "Internal openings - long edges only"
+                    IncludeLoop = Not IsOuterLoop
+                Case "Internal openings + external perimeter"
+                    IncludeLoop = True
+                Case "External perimeter only"
+                    IncludeLoop = IsOuterLoop
+                Case Else
+                    IncludeLoop = Not IsOuterLoop
+            End Select
+
+            Logger.Info("Boundary loop " & LoopsAnalysed & ": " & LoopType & _
+                        If(IncludeLoop, " [IN SCOPE]", " [EXCLUDED BY PROFILE]"))
+
+            ' Determine the longest straight edge in this loop for the
+            ' optional long-edge-only profile.
+            Dim LongestStraightEdgeMM As Double = 0
+            For Each Edge As Inventor.Edge In Loop.Edges
+                Dim ThisLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
+                If ThisLengthMM > LongestStraightEdgeMM Then LongestStraightEdgeMM = ThisLengthMM
+            Next
+
+            For Each Edge As Inventor.Edge In Loop.Edges
+                EdgesAnalysed += 1
+                Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
+                Dim IsStraight As Boolean = IsStraightEdge(Edge)
+                Dim IsCandidate As Boolean = IncludeLoop
+                Dim Reason As String = "Boundary permitted by selected profile"
+
+                If Not IsStraight Then
+                    IsCandidate = False
+                    Reason = "Curved edge not supported by initial analyser"
+                ElseIf Not IncludeLoop Then
+                    IsCandidate = False
+                    Reason = "Boundary excluded by selected profile"
+                ElseIf EdgeLengthMM < MinimumNibEdgeLengthMM Then
+                    IsCandidate = False
+                    Reason = "Below minimum edge length"
+                ElseIf EdgeLengthMM <= (2 * MinimumNibEndClearanceMM) Then
+                    IsCandidate = False
+                    Reason = "Insufficient length after end clearances"
+                ElseIf NibProfile = "Internal openings - long edges only" AndAlso _
+                       EdgeLengthMM < (LongestStraightEdgeMM * 0.75) Then
+                    IsCandidate = False
+                    Reason = "Not a long side under the selected profile heuristic"
+                End If
+
+                Logger.Info("Edge " & EdgesAnalysed & _
+                            " | Type=" & If(IsStraight, "Straight", "Curved/other") & _
+                            " | Length=" & Math.Round(EdgeLengthMM, 2) & " mm" & _
+                            " | " & If(IsCandidate, "CANDIDATE", "REJECTED") & _
+                            " | " & Reason)
+
+                If IsCandidate Then
+                    CandidateEdges += 1
+                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * MinimumNibEndClearanceMM)
+                    Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
+                    If IntervalCount < 1 Then IntervalCount = 1
+                    Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
+                    Dim PositionCount As Integer = IntervalCount + 1
+
+                    Logger.Info("  Candidate positions from edge start (mm):")
+                    For PositionIndex As Integer = 0 To IntervalCount
+                        Dim PositionMM As Double = MinimumNibEndClearanceMM + (PositionIndex * ActualSpacingMM)
+                        Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
+                        CandidatePositions += 1
+                    Next
+                    Logger.Info("  Calculated spacing: " & Math.Round(ActualSpacingMM, 2) & _
+                                " mm; maximum allowed: " & MaximumNibSpacingMM & " mm")
+                Else
+                    RejectedEdges += 1
+                End If
+            Next
+        Next
+    Next
+
+    Logger.Section("NIB ANALYSIS SUMMARY - " & OccurrenceName)
+    Logger.Info("Solid bodies analysed: " & BodiesAnalysed)
+    Logger.Info("Boundary loops analysed: " & LoopsAnalysed)
+    Logger.Info("Edges inspected: " & EdgesAnalysed)
+    Logger.Info("Candidate edges: " & CandidateEdges)
+    Logger.Info("Rejected edges: " & RejectedEdges)
+    Logger.Info("Calculated candidate positions: " & CandidatePositions)
+    Logger.Warning("Candidate positions are distances along edges only; no nibs were inserted.")
+
+End Sub
+
+
+Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
+    Try
+        Return TypeOf Edge.Geometry Is Inventor.LineSegment
+    Catch
+        Return False
+    End Try
+End Function
+
+
+Function GetStraightEdgeLengthMM( _
+    PartDoc As Inventor.PartDocument, _
+    Edge As Inventor.Edge) As Double
+
+    Try
+        If Not IsStraightEdge(Edge) Then Return 0
+        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Return 0
+        Dim LengthCM As Double = Edge.StartVertex.Point.DistanceTo(Edge.StopVertex.Point)
+        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
+    Catch
+        Return 0
+    End Try
+End Function
 
 
 ' ============================================================
