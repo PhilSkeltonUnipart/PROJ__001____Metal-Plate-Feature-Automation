@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4
+' Version: 0.4.1
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -750,12 +750,12 @@ Sub AnalyzePlateGeometry( _
         BodiesAnalysed += 1
         Logger.Info("Analysing principal planar face on solid body " & BodiesAnalysed)
 
-        For Each Loop As Inventor.EdgeLoop In MainFace.EdgeLoops
+        For Each BoundaryLoop As Inventor.EdgeLoop In MainFace.EdgeLoops
             LoopsAnalysed += 1
 
             Dim IsOuterLoop As Boolean = False
             Try
-                IsOuterLoop = Loop.IsOuterEdgeLoop
+                IsOuterLoop = BoundaryLoop.IsOuterEdgeLoop
             Catch
                 Logger.Warning("Unable to classify a boundary loop; loop skipped.")
                 Continue For
@@ -781,12 +781,12 @@ Sub AnalyzePlateGeometry( _
             ' Determine the longest straight edge in this loop for the
             ' optional long-edge-only profile.
             Dim LongestStraightEdgeMM As Double = 0
-            For Each Edge As Inventor.Edge In Loop.Edges
+            For Each Edge As Inventor.Edge In BoundaryLoop.Edges
                 Dim ThisLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
                 If ThisLengthMM > LongestStraightEdgeMM Then LongestStraightEdgeMM = ThisLengthMM
             Next
 
-            For Each Edge As Inventor.Edge In Loop.Edges
+            For Each Edge As Inventor.Edge In BoundaryLoop.Edges
                 EdgesAnalysed += 1
                 Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
                 Dim IsStraight As Boolean = IsStraightEdge(Edge)
