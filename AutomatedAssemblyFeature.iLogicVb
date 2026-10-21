@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.1
+' Version: 0.4.2
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -704,6 +704,7 @@ Sub AnalyzePlateGeometry( _
     Logger.Section("NIB EDGE ANALYSIS")
     Logger.Info("Occurrence: " & OccurrenceName)
     Logger.Info("Part file: " & System.IO.Path.GetFileNameWithoutExtension(PartDoc.FullFileName))
+    Logger.Info("Selected profile: " & NibProfile)
 
     Dim PartDef As Inventor.PartComponentDefinition = Nothing
     Try
@@ -719,36 +720,71 @@ Sub AnalyzePlateGeometry( _
     Dim CandidateEdges As Integer = 0
     Dim RejectedEdges As Integer = 0
     Dim CandidatePositions As Integer = 0
+    Dim BodyIndex As Integer = 0
+
+    Logger.Info("Surface bodies found: " & PartDef.SurfaceBodies.Count)
 
     For Each Body As Inventor.SurfaceBody In PartDef.SurfaceBodies
+        BodyIndex += 1
         If Body Is Nothing Then Continue For
-        If Not Body.IsSolid Then Continue For
 
-        ' Pick the largest planar face as the principal plate face.
-        ' This avoids analysing both broad sides of a flat plate.
+        Logger.Info("Body " & BodyIndex & ": IsSolid=" & Body.IsSolid & _
+                    "; faces=" & Body.Faces.Count)
+
+        If Not Body.IsSolid Then
+            Logger.Warning("Body " & BodyIndex & " is a surface body, not a solid body; skipped.")
+            Continue For
+        End If
+
+        ' Sheet-metal parts are represented by solid B-rep bodies in Inventor.
+        ' Try both SurfaceType and the underlying geometry type because API
+        ' wrappers can expose these differently for some imported/derived parts.
         Dim MainFace As Inventor.Face = Nothing
-        Dim LargestFaceArea As Double = 0
+        Dim LargestPlanarFaceArea As Double = -1
+        Dim LargestAnyFace As Inventor.Face = Nothing
+        Dim LargestAnyFaceArea As Double = -1
+        Dim PlanarFacesFound As Integer = 0
+        Dim FaceIndex As Integer = 0
 
         For Each Face As Inventor.Face In Body.Faces
-            Try
-                If Face.SurfaceType = Inventor.SurfaceTypeEnum.kPlaneSurface Then
-                    If Face.Area > LargestFaceArea Then
-                        LargestFaceArea = Face.Area
-                        MainFace = Face
-                    End If
+            FaceIndex += 1
+            If Face Is Nothing Then Continue For
+
+            Dim FaceArea As Double = TryGetFaceArea(Face)
+            If FaceArea > LargestAnyFaceArea Then
+                LargestAnyFaceArea = FaceArea
+                LargestAnyFace = Face
+            End If
+
+            If IsPlanarFaceForAnalysis(Face) Then
+                PlanarFacesFound += 1
+                If FaceArea > LargestPlanarFaceArea Then
+                    LargestPlanarFaceArea = FaceArea
+                    MainFace = Face
                 End If
-            Catch
-                ' Ignore faces whose area/type cannot be read.
-            End Try
+            End If
         Next
 
+        Logger.Info("Body " & BodyIndex & ": planar faces recognised=" & PlanarFacesFound)
+
+        ' Fallback: if the plane test failed for this model, use the largest
+        ' face as a diagnostic fallback instead of silently returning zero edges.
+        ' The log explicitly flags this so the results can be checked carefully.
+        If MainFace Is Nothing AndAlso LargestAnyFace IsNot Nothing Then
+            MainFace = LargestAnyFace
+            Logger.Warning("No planar face was recognised on body " & BodyIndex & _
+                           "; analysing its largest-area face as a FALLBACK. Verify candidates before relying on them.")
+        End If
+
         If MainFace Is Nothing Then
-            Logger.Warning("No planar face found on a solid body; body skipped.")
+            Logger.Warning("No usable face found on body " & BodyIndex & "; body skipped.")
             Continue For
         End If
 
         BodiesAnalysed += 1
-        Logger.Info("Analysing principal planar face on solid body " & BodiesAnalysed)
+        Logger.Info("Analysing selected face on body " & BodyIndex & _
+                    "; area=" & Math.Round(Math.Max(0, LargestPlanarFaceArea), 3) & " database units squared" & _
+                    "; edge loops=" & MainFace.EdgeLoops.Count)
 
         For Each BoundaryLoop As Inventor.EdgeLoop In MainFace.EdgeLoops
             LoopsAnalysed += 1
@@ -756,8 +792,9 @@ Sub AnalyzePlateGeometry( _
             Dim IsOuterLoop As Boolean = False
             Try
                 IsOuterLoop = BoundaryLoop.IsOuterEdgeLoop
-            Catch
-                Logger.Warning("Unable to classify a boundary loop; loop skipped.")
+            Catch ex As Exception
+                Logger.Warning("Unable to classify boundary loop " & LoopsAnalysed & _
+                               "; loop skipped. " & ex.Message)
                 Continue For
             End Try
 
@@ -778,8 +815,6 @@ Sub AnalyzePlateGeometry( _
             Logger.Info("Boundary loop " & LoopsAnalysed & ": " & LoopType & _
                         If(IncludeLoop, " [IN SCOPE]", " [EXCLUDED BY PROFILE]"))
 
-            ' Determine the longest straight edge in this loop for the
-            ' optional long-edge-only profile.
             Dim LongestStraightEdgeMM As Double = 0
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
                 Dim ThisLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
@@ -788,6 +823,7 @@ Sub AnalyzePlateGeometry( _
 
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
                 EdgesAnalysed += 1
+
                 Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
                 Dim IsStraight As Boolean = IsStraightEdge(Edge)
                 Dim IsCandidate As Boolean = IncludeLoop
@@ -823,7 +859,6 @@ Sub AnalyzePlateGeometry( _
                     Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
                     If IntervalCount < 1 Then IntervalCount = 1
                     Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
-                    Dim PositionCount As Integer = IntervalCount + 1
 
                     Logger.Info("  Candidate positions from edge start (mm):")
                     For PositionIndex As Integer = 0 To IntervalCount
@@ -852,24 +887,32 @@ Sub AnalyzePlateGeometry( _
 End Sub
 
 
-Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
+Function IsPlanarFaceForAnalysis(Face As Inventor.Face) As Boolean
+    If Face Is Nothing Then Return False
+
     Try
-        Return TypeOf Edge.Geometry Is Inventor.LineSegment
+        If Face.SurfaceType = Inventor.SurfaceTypeEnum.kPlaneSurface Then
+            Return True
+        End If
     Catch
-        Return False
+        ' Try geometry type below.
     End Try
+
+    Try
+        If TypeOf Face.Geometry Is Inventor.Plane Then
+            Return True
+        End If
+    Catch
+        ' Geometry type is not exposed as a Plane; caller can use fallback.
+    End Try
+
+    Return False
 End Function
 
 
-Function GetStraightEdgeLengthMM( _
-    PartDoc As Inventor.PartDocument, _
-    Edge As Inventor.Edge) As Double
-
+Function TryGetFaceArea(Face As Inventor.Face) As Double
     Try
-        If Not IsStraightEdge(Edge) Then Return 0
-        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Return 0
-        Dim LengthCM As Double = Edge.StartVertex.Point.DistanceTo(Edge.StopVertex.Point)
-        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
+        Return Face.Area
     Catch
         Return 0
     End Try
