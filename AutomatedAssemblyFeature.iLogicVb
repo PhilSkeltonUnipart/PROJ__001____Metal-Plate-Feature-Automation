@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.2
+' Version: 0.4.3
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -913,6 +913,43 @@ End Function
 Function TryGetFaceArea(Face As Inventor.Face) As Double
     Try
         Return Face.Area
+    Catch
+        Return 0
+    End Try
+End Function
+
+
+' ------------------------------------------------------------
+' EDGE GEOMETRY HELPERS
+' These were inadvertently omitted when the face-detection
+' helpers were added in v0.4.2. Keep these functions in the
+' same rule so edge classification and length measurement compile.
+' ------------------------------------------------------------
+
+Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
+    If Edge Is Nothing Then Return False
+
+    Try
+        Return TypeOf Edge.Geometry Is Inventor.LineSegment
+    Catch
+        Return False
+    End Try
+End Function
+
+
+Function GetStraightEdgeLengthMM( _
+    PartDoc As Inventor.PartDocument, _
+    Edge As Inventor.Edge) As Double
+
+    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return 0
+
+    Try
+        If Not IsStraightEdge(Edge) Then Return 0
+        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Return 0
+
+        ' Inventor database length units are centimetres; convert to mm.
+        Dim LengthCM As Double = Edge.StartVertex.Point.DistanceTo(Edge.StopVertex.Point)
+        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
     Catch
         Return 0
     End Try
