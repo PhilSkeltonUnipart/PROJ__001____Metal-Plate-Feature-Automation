@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.4
+' Version: 0.4.5
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -683,12 +683,17 @@ End Sub
  ' ============================================================
 ' NIB EDGE ANALYSIS - REPORT ONLY
 '
+' Version 0.4.5: vector-angle edge orientation classification.
+'
 ' Version 0.4.4 geometry strategy:
 '   - Identify the broad planar face, not merely any planar face.
 '   - Rank planar faces first by how many boundary edges are much
 '     longer than the measured sheet thickness, then by face area.
 '   - Analyse only boundary loops belonging to that broad face.
-'   - Reject edges whose length is consistent with sheet thickness.
+'   - Report in-plane, thickness-direction and ambiguous edge orientations.
+'   - Classify straight edges by comparing their direction with the selected
+'     broad face normal (vector-angle method).
+'   - Use physical thickness only as a secondary sanity check.
 '   - Apply the selected nib profile after geometric classification.
 '   - Calculate positions only; never insert nibs or modify assembly.
 '
@@ -711,6 +716,11 @@ Sub AnalyzePlateGeometry( _
     Logger.Info("Selected profile: " & NibProfile)
     Logger.Info("Measured physical thickness supplied to analyser: " & _
                 Math.Round(PhysicalThicknessMM, 3) & " mm")
+
+    ' Angular tolerance used when comparing edge direction with the plate normal.
+    ' One degree is a starting diagnostic tolerance, not an engineering standard.
+    Dim OrientationToleranceDegrees As Double = 1.0
+    Logger.Info("Edge orientation angular tolerance: " & OrientationToleranceDegrees & " degrees")
 
     Dim PartDef As Inventor.PartComponentDefinition = Nothing
     Try
@@ -742,10 +752,9 @@ Sub AnalyzePlateGeometry( _
             Continue For
         End If
 
-        ' Find the broad planar face. A side face on a 3 mm plate can have
-        ' two 1000 mm edges and two 3 mm edges. Ranking only by area can be
-        ' unreliable for imported/derived geometry, so the number of long
-        ' boundary edges is the primary score and area breaks ties.
+        ' Find the broad planar face. The existing thickness-aware boundary score
+        ' selects a likely broad face; edge orientation is then classified
+        ' independently by comparing each edge direction with that face normal.
         Dim MainFace As Inventor.Face = Nothing
         Dim BestLongBoundaryEdgeCount As Integer = -1
         Dim BestFaceArea As Double = -1
@@ -837,6 +846,12 @@ Sub AnalyzePlateGeometry( _
 
                 Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
                 Dim IsStraight As Boolean = IsStraightEdge(Edge)
+                Dim AlignmentWithNormal As Double = -1.0
+                Dim OrientationClass As String = ClassifyEdgeAgainstFaceNormal( _
+                    MainFace, Edge, OrientationToleranceDegrees, AlignmentWithNormal)
+
+                ' Thickness is retained as a secondary validation only. The primary
+                ' orientation decision comes from the edge/face-normal vector comparison.
                 Dim IsThicknessScaleEdge As Boolean = False
                 If PhysicalThicknessMM > 0 AndAlso IsStraight Then
                     IsThicknessScaleEdge = (EdgeLengthMM <= PhysicalThicknessMM * 1.5)
@@ -848,9 +863,15 @@ Sub AnalyzePlateGeometry( _
                 If Not IsStraight Then
                     IsCandidate = False
                     Reason = "Curved edge not supported by initial analyser"
+                ElseIf OrientationClass = "THICKNESS-DIRECTION" Then
+                    IsCandidate = False
+                    Reason = "Edge direction is parallel to the plate normal"
+                ElseIf OrientationClass = "AMBIGUOUS" OrElse OrientationClass = "UNAVAILABLE" Then
+                    IsCandidate = False
+                    Reason = "Edge orientation is ambiguous or could not be calculated"
                 ElseIf IsThicknessScaleEdge Then
                     IsCandidate = False
-                    Reason = "Edge length is consistent with plate thickness; not a nibbing boundary"
+                    Reason = "Thickness-scale length validation failed; review edge geometry"
                 ElseIf Not IncludeLoop Then
                     IsCandidate = False
                     Reason = "Boundary excluded by selected profile"
@@ -869,7 +890,9 @@ Sub AnalyzePlateGeometry( _
                 Logger.Info("Edge " & EdgesAnalysed & _
                             " | Type=" & If(IsStraight, "Straight", "Curved/other") & _
                             " | Length=" & Math.Round(EdgeLengthMM, 2) & " mm" & _
-                            " | Geometry=BOUNDARY OF SELECTED PLANAR FACE" & _
+                            " | Orientation=" & OrientationClass & _
+                            " | Abs(dot)=" & If(AlignmentWithNormal >= 0, Math.Round(AlignmentWithNormal, 6).ToString(), "N/A") & _
+                            " | Boundary=SELECTED FACE LOOP" & _
                             " | " & If(IsCandidate, "CANDIDATE", "REJECTED") & _
                             " | " & Reason)
 
@@ -905,6 +928,52 @@ Sub AnalyzePlateGeometry( _
     Logger.Warning("Candidate positions are distances along edges only; no nibs were inserted.")
 
 End Sub
+
+
+Function ClassifyEdgeAgainstFaceNormal( _
+    Face As Inventor.Face, _
+    Edge As Inventor.Edge, _
+    ToleranceDegrees As Double, _
+    ByRef AbsoluteDotProduct As Double) As String
+
+    AbsoluteDotProduct = -1.0
+    If Face Is Nothing OrElse Edge Is Nothing Then Return "UNAVAILABLE"
+
+    Try
+        If Not IsStraightEdge(Edge) Then Return "UNAVAILABLE"
+
+        Dim PlaneGeometry As Inventor.Plane = CType(Face.Geometry, Inventor.Plane)
+        Dim FaceNormal As Inventor.UnitVector = PlaneGeometry.Normal
+        Dim LineGeometry As Inventor.LineSegment = CType(Edge.Geometry, Inventor.LineSegment)
+        Dim EdgeDirection As Inventor.UnitVector = LineGeometry.Direction
+
+        ' UnitVector components are already normalised. Use the absolute dot
+        ' product so reversed edge/face directions classify identically.
+        Dim DotValue As Double = _
+            (FaceNormal.X * EdgeDirection.X) + _
+            (FaceNormal.Y * EdgeDirection.Y) + _
+            (FaceNormal.Z * EdgeDirection.Z)
+
+        AbsoluteDotProduct = Math.Abs(DotValue)
+        If AbsoluteDotProduct > 1.0 Then AbsoluteDotProduct = 1.0
+
+        Dim ToleranceRadians As Double = ToleranceDegrees * Math.PI / 180.0
+        Dim InPlaneLimit As Double = Math.Sin(ToleranceRadians)
+        Dim ThicknessLimit As Double = Math.Cos(ToleranceRadians)
+
+        If AbsoluteDotProduct <= InPlaneLimit Then
+            Return "IN-PLANE"
+        ElseIf AbsoluteDotProduct >= ThicknessLimit Then
+            Return "THICKNESS-DIRECTION"
+        Else
+            Return "AMBIGUOUS"
+        End If
+
+    Catch ex As Exception
+        Logger.Debug("Edge/face-normal vector comparison failed: " & ex.Message)
+        Return "UNAVAILABLE"
+    End Try
+End Function
 
 
 Function CountLongBoundaryEdges( _
