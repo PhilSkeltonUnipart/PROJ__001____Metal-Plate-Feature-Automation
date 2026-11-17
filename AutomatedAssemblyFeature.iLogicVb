@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.6
+' Version: 0.4.7
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -15,11 +15,13 @@
 '   - Measure physical plate thickness from geometry
 '   - Warn only if sheet-metal parameter thickness differs
 '   - Analyse internal openings and/or external boundaries using a selected profile
-'   - Calculate evenly distributed candidate nib positions using centre-to-centre spacing (report only)
+'   - Use independent internal-opening and external-perimeter clearances / usable lengths
+'   - Calculate assembly-space candidate positions and display temporary client-graphics markers
 '   - Reject edges with insufficient usable length or nib separation
 '   - Produce a centralised diagnostic log
 '
-' IMPORTANT: This version does NOT insert nibs or modify the assembly.
+' IMPORTANT: This version does NOT insert nibs or modify model geometry/constraints.
+' Temporary client graphics are displayed in the active assembly and are not saved with it.
 '
 ' ============================================================
 
@@ -43,10 +45,18 @@ Sub Main()
     ' Nib analysis settings. These are initial test values and
     ' should be confirmed against the engineering standard.
     Dim MinimumNibEdgeLengthMM As Double = 150.0
-    Dim MinimumNibEndClearanceMM As Double = 75.0
+    Dim ExternalEndClearanceMM As Double = 75.0
+    Dim InternalEndClearanceMM As Double = 50.0
     Dim MaximumNibSpacingMM As Double = 300.0
-    Dim MinimumUsableNibEdgeLengthMM As Double = 150.0
+    Dim ExternalMinimumUsableLengthMM As Double = 150.0
+    Dim InternalMinimumUsableLengthMM As Double = 150.0
     Dim MinimumNibCentreSeparationMM As Double = 150.0
+
+    ' Marker graphics are collected in assembly coordinates and drawn once
+    ' after scanning. They are temporary ClientGraphics, not model features.
+    Dim InternalMarkerCoordinates As New System.Collections.ArrayList
+    Dim ExternalMarkerCoordinates As New System.Collections.ArrayList
+    Dim RootAssemblyTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
 
     ' Ask for one profile per run. No individual edge selection
     ' is required; geometry detection is automatic.
@@ -226,9 +236,11 @@ Sub Main()
 
         Logger.Info("Nibbing profile: " & NibProfile)
         Logger.Info("Minimum candidate edge length: " & MinimumNibEdgeLengthMM & " mm")
-        Logger.Info("Minimum end clearance: " & MinimumNibEndClearanceMM & " mm")
+        Logger.Info("External perimeter end clearance: " & ExternalEndClearanceMM & " mm")
+        Logger.Info("Internal opening end clearance: " & InternalEndClearanceMM & " mm")
         Logger.Info("Maximum nib centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
-        Logger.Info("Minimum usable nib edge length: " & MinimumUsableNibEdgeLengthMM & " mm")
+        Logger.Info("External minimum usable edge length: " & ExternalMinimumUsableLengthMM & " mm")
+        Logger.Info("Internal minimum usable edge length: " & InternalMinimumUsableLengthMM & " mm")
         Logger.Info("Minimum nib centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
         Logger.Warning("Analysis-only mode: no nibs will be inserted and no geometry will be changed.")
 
@@ -238,10 +250,15 @@ Sub Main()
             ThicknessWarningToleranceMM, _
             NibProfile, _
             MinimumNibEdgeLengthMM, _
-            MinimumNibEndClearanceMM, _
+            ExternalEndClearanceMM, _
+            InternalEndClearanceMM, _
             MaximumNibSpacingMM, _
-            MinimumUsableNibEdgeLengthMM, _
+            ExternalMinimumUsableLengthMM, _
+            InternalMinimumUsableLengthMM, _
             MinimumNibCentreSeparationMM, _
+            InternalMarkerCoordinates, _
+            ExternalMarkerCoordinates, _
+            RootAssemblyTransform, _
             TotalOccurrences, _
             TotalParts, _
             SheetMetalParts, _
@@ -249,6 +266,8 @@ Sub Main()
             EligiblePlates, _
             InvalidNames, _
             SubAssemblies)
+
+        DrawNibCandidateMarkers(AssemblyDoc, InternalMarkerCoordinates, ExternalMarkerCoordinates)
 
 
         ' ----------------------------------------------------
@@ -343,10 +362,15 @@ Sub ScanOccurrences( _
     ThicknessWarningToleranceMM As Double, _
     NibProfile As String, _
     MinimumNibEdgeLengthMM As Double, _
-    MinimumNibEndClearanceMM As Double, _
+    ExternalEndClearanceMM As Double, _
+    InternalEndClearanceMM As Double, _
     MaximumNibSpacingMM As Double, _
-    MinimumUsableNibEdgeLengthMM As Double, _
+    ExternalMinimumUsableLengthMM As Double, _
+    InternalMinimumUsableLengthMM As Double, _
     MinimumNibCentreSeparationMM As Double, _
+    InternalMarkerCoordinates As System.Collections.ArrayList, _
+    ExternalMarkerCoordinates As System.Collections.ArrayList, _
+    ParentAssemblyTransform As Inventor.Matrix, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
     ByRef SheetMetalParts As Integer, _
@@ -363,6 +387,8 @@ Sub ScanOccurrences( _
     For Each Occurrence As Inventor.ComponentOccurrence _
         In Occurrences
 
+        Dim CurrentOccurrenceTransform As Inventor.Matrix = ParentAssemblyTransform.Copy()
+        CurrentOccurrenceTransform.PostMultiplyBy(Occurrence.Transformation)
 
         TotalOccurrences += 1
 
@@ -448,10 +474,15 @@ Sub ScanOccurrences( _
                 ThicknessWarningToleranceMM, _
                 NibProfile, _
                 MinimumNibEdgeLengthMM, _
-                MinimumNibEndClearanceMM, _
+                ExternalEndClearanceMM, _
+                InternalEndClearanceMM, _
                 MaximumNibSpacingMM, _
-                MinimumUsableNibEdgeLengthMM, _
+                ExternalMinimumUsableLengthMM, _
+                InternalMinimumUsableLengthMM, _
                 MinimumNibCentreSeparationMM, _
+                InternalMarkerCoordinates, _
+                ExternalMarkerCoordinates, _
+                CurrentOccurrenceTransform, _
                 TotalOccurrences, _
                 TotalParts, _
                 SheetMetalParts, _
@@ -677,11 +708,16 @@ Sub ScanOccurrences( _
             Occurrence.Name,
             NibProfile,
             PhysicalThicknessMM,
+            CurrentOccurrenceTransform,
             MinimumNibEdgeLengthMM,
-            MinimumNibEndClearanceMM,
-            MaximumNibSpacingMM, _
-            MinimumUsableNibEdgeLengthMM, _
-            MinimumNibCentreSeparationMM)
+            ExternalEndClearanceMM,
+            InternalEndClearanceMM,
+            MaximumNibSpacingMM,
+            ExternalMinimumUsableLengthMM,
+            InternalMinimumUsableLengthMM,
+            MinimumNibCentreSeparationMM,
+            InternalMarkerCoordinates,
+            ExternalMarkerCoordinates)
 
         ' Nib selection and insertion are intentionally not called.
 
@@ -708,6 +744,8 @@ End Sub
 '     broad face normal (vector-angle method).
 '   - Use physical thickness only as a secondary sanity check.
 '   - Apply the selected nib profile after geometric classification.
+'   - Use independent clearances for internal openings and external perimeters.
+'   - Transform calculated nib centres into assembly coordinates and draw temporary markers.
 '   - Calculate positions only; never insert nibs or modify assembly.
 '
 ' This is intended to handle rotated plates and angled outlines because
@@ -719,11 +757,16 @@ Sub AnalyzePlateGeometry( _
     OccurrenceName As String, _
     NibProfile As String, _
     PhysicalThicknessMM As Double, _
+    OccurrenceTransform As Inventor.Matrix, _
     MinimumNibEdgeLengthMM As Double, _
-    MinimumNibEndClearanceMM As Double, _
+    ExternalEndClearanceMM As Double, _
+    InternalEndClearanceMM As Double, _
     MaximumNibSpacingMM As Double, _
-    MinimumUsableNibEdgeLengthMM As Double, _
-    MinimumNibCentreSeparationMM As Double)
+    ExternalMinimumUsableLengthMM As Double, _
+    InternalMinimumUsableLengthMM As Double, _
+    MinimumNibCentreSeparationMM As Double, _
+    InternalMarkerCoordinates As System.Collections.ArrayList, _
+    ExternalMarkerCoordinates As System.Collections.ArrayList)
 
     Logger.Section("NIB EDGE ANALYSIS")
     Logger.Info("Occurrence: " & OccurrenceName)
@@ -736,8 +779,11 @@ Sub AnalyzePlateGeometry( _
     ' One degree is a starting diagnostic tolerance, not an engineering standard.
     Dim OrientationToleranceDegrees As Double = 1.0
     Logger.Info("Edge orientation angular tolerance: " & OrientationToleranceDegrees & " degrees")
+    Logger.Info("External perimeter end clearance: " & ExternalEndClearanceMM & " mm")
+    Logger.Info("Internal opening end clearance: " & InternalEndClearanceMM & " mm")
     Logger.Info("Maximum centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
-    Logger.Info("Minimum usable edge length: " & MinimumUsableNibEdgeLengthMM & " mm")
+    Logger.Info("External minimum usable length: " & ExternalMinimumUsableLengthMM & " mm")
+    Logger.Info("Internal minimum usable length: " & InternalMinimumUsableLengthMM & " mm")
     Logger.Info("Minimum centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
 
     Dim PartDef As Inventor.PartComponentDefinition = Nothing
@@ -897,12 +943,13 @@ Sub AnalyzePlateGeometry( _
                 ElseIf EdgeLengthMM < MinimumNibEdgeLengthMM Then
                     IsCandidate = False
                     Reason = "Below minimum edge length"
-                ElseIf EdgeLengthMM <= (2 * MinimumNibEndClearanceMM) Then
+                ElseIf EdgeLengthMM <= (2 * If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM)) Then
                     IsCandidate = False
-                    Reason = "Insufficient length after end clearances"
-                ElseIf (EdgeLengthMM - (2 * MinimumNibEndClearanceMM)) < MinimumUsableNibEdgeLengthMM Then
+                    Reason = "Insufficient length after boundary-specific end clearances"
+                ElseIf (EdgeLengthMM - (2 * If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM))) < _
+                       If(IsOuterLoop, ExternalMinimumUsableLengthMM, InternalMinimumUsableLengthMM) Then
                     IsCandidate = False
-                    Reason = "Usable length after end clearances is below minimum usable edge length"
+                    Reason = "Usable length after boundary-specific end clearances is below the configured minimum"
                 ElseIf NibProfile = "Internal openings - long edges only" AndAlso _
                        EdgeLengthMM < (LongestStraightEdgeMM * 0.75) Then
                     IsCandidate = False
@@ -919,12 +966,12 @@ Sub AnalyzePlateGeometry( _
                             " | " & Reason)
 
                 If IsCandidate Then
-                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * MinimumNibEndClearanceMM)
+                    Dim EdgeEndClearanceMM As Double = If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM)
+                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * EdgeEndClearanceMM)
 
-                    ' Use the smallest whole number of intervals that keeps every
-                    ' centre-to-centre gap at or below the maximum spacing.
-                    ' Then verify that the resulting equal spacing is not below
-                    ' the configured minimum separation.
+                    ' Divide the usable span into equal centre-to-centre intervals.
+                    ' The first and last nib centres sit exactly at the configured
+                    ' end clearances. The interval count must satisfy both bounds.
                     Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
                     If IntervalCount < 1 Then IntervalCount = 1
                     Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
@@ -938,11 +985,23 @@ Sub AnalyzePlateGeometry( _
                     Else
                         CandidateEdges += 1
                         Logger.Info("  Candidate positions from edge start (mm):")
+                        Dim StartVertex As Inventor.Vertex = Edge.StartVertex
+                        Dim StopVertex As Inventor.Vertex = Edge.StopVertex
+                        If StartVertex Is Nothing OrElse StopVertex Is Nothing Then
+                            Logger.Warning("  Candidate positions retained in report only; edge vertices unavailable for visual marker coordinates.")
+                        End If
                         For PositionIndex As Integer = 0 To IntervalCount
-                            Dim PositionMM As Double = MinimumNibEndClearanceMM + (PositionIndex * ActualSpacingMM)
+                            Dim PositionMM As Double = EdgeEndClearanceMM + (PositionIndex * ActualSpacingMM)
                             Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
                             CandidatePositions += 1
+                            If StartVertex IsNot Nothing AndAlso StopVertex IsNot Nothing Then
+                                AddCandidateMarkerCoordinate(PartDoc, StartVertex.Point, StopVertex.Point, _
+                                    PositionMM, EdgeLengthMM, OccurrenceTransform, IsOuterLoop, _
+                                    InternalMarkerCoordinates, ExternalMarkerCoordinates)
+                            End If
                         Next
+                        Logger.Info("  Boundary type: " & LoopType)
+                        Logger.Info("  Applied end clearance: " & EdgeEndClearanceMM & " mm")
                         Logger.Info("  Usable length: " & Math.Round(UsableLengthMM, 2) & " mm")
                         Logger.Info("  Nib centre count: " & (IntervalCount + 1))
                         Logger.Info("  Actual centre-to-centre spacing: " & Math.Round(ActualSpacingMM, 2) & _
@@ -963,8 +1022,139 @@ Sub AnalyzePlateGeometry( _
     Logger.Info("Candidate edges: " & CandidateEdges)
     Logger.Info("Rejected edges: " & RejectedEdges)
     Logger.Info("Calculated candidate positions: " & CandidatePositions)
-    Logger.Warning("Candidate positions are distances along edges only; no nibs were inserted.")
+    Logger.Warning("Candidate positions were transformed into assembly-space temporary markers; no nibs were inserted and no model geometry was changed.")
 
+End Sub
+
+
+' ============================================================
+' TEMPORARY CANDIDATE MARKER GRAPHICS
+' ============================================================
+
+Sub AddCandidateMarkerCoordinate( _
+    PartDoc As Inventor.PartDocument, _
+    StartPoint As Inventor.Point, _
+    EndPoint As Inventor.Point, _
+    DistanceAlongEdgeMM As Double, _
+    EdgeLengthMM As Double, _
+    OccurrenceTransform As Inventor.Matrix, _
+    IsExternal As Boolean, _
+    InternalCoordinates As System.Collections.ArrayList, _
+    ExternalCoordinates As System.Collections.ArrayList)
+
+    Try
+        If PartDoc Is Nothing OrElse StartPoint Is Nothing OrElse EndPoint Is Nothing Then Exit Sub
+        If EdgeLengthMM <= 0 Then Exit Sub
+
+        Dim Fraction As Double = DistanceAlongEdgeMM / EdgeLengthMM
+        If Fraction < 0 OrElse Fraction > 1 Then Exit Sub
+
+        ' Inventor database coordinates are centimetres. Interpolate in part
+        ' coordinates, then transform into the active assembly coordinate frame.
+        Dim X As Double = StartPoint.X + ((EndPoint.X - StartPoint.X) * Fraction)
+        Dim Y As Double = StartPoint.Y + ((EndPoint.Y - StartPoint.Y) * Fraction)
+        Dim Z As Double = StartPoint.Z + ((EndPoint.Z - StartPoint.Z) * Fraction)
+        Dim MarkerPoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(X, Y, Z)
+        MarkerPoint.TransformBy(OccurrenceTransform)
+
+        Dim Target As System.Collections.ArrayList = If(IsExternal, ExternalCoordinates, InternalCoordinates)
+        Target.Add(CDbl(MarkerPoint.X))
+        Target.Add(CDbl(MarkerPoint.Y))
+        Target.Add(CDbl(MarkerPoint.Z))
+    Catch ex As Exception
+        Logger.Debug("Unable to calculate assembly-space marker coordinate: " & ex.Message)
+    End Try
+End Sub
+
+
+Sub DrawNibCandidateMarkers( _
+    AssemblyDoc As Inventor.AssemblyDocument, _
+    InternalCoordinates As System.Collections.ArrayList, _
+    ExternalCoordinates As System.Collections.ArrayList)
+
+    If AssemblyDoc Is Nothing Then Exit Sub
+
+    Const GraphicsId As String = "InventorNibAutomation_v047_CandidateMarkers"
+    Try
+        ' Remove markers from a previous run of this rule, if present.
+        Try
+            AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Item(GraphicsId).Delete()
+        Catch
+        End Try
+        Try
+            AssemblyDoc.GraphicsDataSetsCollection.Item(GraphicsId).Delete()
+        Catch
+        End Try
+
+        If InternalCoordinates.Count = 0 AndAlso ExternalCoordinates.Count = 0 Then
+            Logger.Warning("No candidate marker coordinates were generated; no visual markers displayed.")
+            Exit Sub
+        End If
+
+        Dim DataSets As Inventor.GraphicsDataSets = AssemblyDoc.GraphicsDataSetsCollection.Add(GraphicsId)
+        Dim ClientGraphics As Inventor.ClientGraphics = AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Add(GraphicsId)
+
+        If InternalCoordinates.Count > 0 Then
+            AddMarkerCrossGraphics(DataSets, ClientGraphics, InternalCoordinates, 1, 0, 180, 255)
+        End If
+        If ExternalCoordinates.Count > 0 Then
+            AddMarkerCrossGraphics(DataSets, ClientGraphics, ExternalCoordinates, 2, 255, 140, 0)
+        End If
+
+        ThisApplication.ActiveView.Update()
+        Logger.Success("Temporary nib candidate markers displayed in assembly: internal=" & _
+                       (InternalCoordinates.Count \ 3) & "; external=" & (ExternalCoordinates.Count \ 3))
+        Logger.Info("Marker graphics are transient ClientGraphics and are not saved as model geometry.")
+    Catch ex As Exception
+        Logger.Warning("Unable to display temporary candidate markers: " & ex.Message)
+    End Try
+End Sub
+
+
+Sub AddMarkerCrossGraphics( _
+    DataSets As Inventor.GraphicsDataSets, _
+    ClientGraphics As Inventor.ClientGraphics, _
+    Coordinates As System.Collections.ArrayList, _
+    NodeId As Integer, _
+    Red As Integer, _
+    Green As Integer, _
+    Blue As Integer)
+
+    Try
+        Dim LineCoordinates As New System.Collections.ArrayList
+        ' A small 3D cross (2 mm total span per axis) makes each candidate
+        ' visible without creating any sketch, feature, or physical component.
+        Dim HalfSizeCM As Double = 0.1
+        For i As Integer = 0 To Coordinates.Count - 1 Step 3
+            Dim X As Double = CDbl(Coordinates(i))
+            Dim Y As Double = CDbl(Coordinates(i + 1))
+            Dim Z As Double = CDbl(Coordinates(i + 2))
+            LineCoordinates.Add(X - HalfSizeCM) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z)
+            LineCoordinates.Add(X + HalfSizeCM) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z)
+            LineCoordinates.Add(X) : LineCoordinates.Add(Y - HalfSizeCM) : LineCoordinates.Add(Z)
+            LineCoordinates.Add(X) : LineCoordinates.Add(Y + HalfSizeCM) : LineCoordinates.Add(Z)
+            LineCoordinates.Add(X) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z - HalfSizeCM)
+            LineCoordinates.Add(X) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z + HalfSizeCM)
+        Next
+
+        Dim CoordinateSet As Inventor.GraphicsCoordinateSet = DataSets.CreateCoordinateSet(NodeId)
+        Dim Values(LineCoordinates.Count - 1) As Double
+        For i As Integer = 0 To LineCoordinates.Count - 1
+            Values(i) = CDbl(LineCoordinates(i))
+        Next
+        CoordinateSet.PutCoordinates(Values)
+
+        Dim Node As Inventor.GraphicsNode = ClientGraphics.AddNode(NodeId)
+        Node.Selectable = False
+        Dim Lines As Inventor.LineGraphics = Node.AddLineGraphics()
+        Lines.CoordinateSet = CoordinateSet
+
+        Dim ColorSet As Inventor.GraphicsColorSet = DataSets.CreateColorSet(NodeId)
+        ColorSet.Add(1, Red, Green, Blue)
+        Lines.ColorSet = ColorSet
+    Catch ex As Exception
+        Logger.Warning("Unable to create one candidate marker group: " & ex.Message)
+    End Try
 End Sub
 
 
@@ -1866,3 +2056,4 @@ Class Logger
 
 
 End Class
+
