@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
 '
-' Version: 0.4.5
+' Version: 0.4.6
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -15,7 +15,8 @@
 '   - Measure physical plate thickness from geometry
 '   - Warn only if sheet-metal parameter thickness differs
 '   - Analyse internal openings and/or external boundaries using a selected profile
-'   - Calculate evenly distributed candidate nib positions (report only)
+'   - Calculate evenly distributed candidate nib positions using centre-to-centre spacing (report only)
+'   - Reject edges with insufficient usable length or nib separation
 '   - Produce a centralised diagnostic log
 '
 ' IMPORTANT: This version does NOT insert nibs or modify the assembly.
@@ -44,6 +45,8 @@ Sub Main()
     Dim MinimumNibEdgeLengthMM As Double = 150.0
     Dim MinimumNibEndClearanceMM As Double = 75.0
     Dim MaximumNibSpacingMM As Double = 300.0
+    Dim MinimumUsableNibEdgeLengthMM As Double = 150.0
+    Dim MinimumNibCentreSeparationMM As Double = 150.0
 
     ' Ask for one profile per run. No individual edge selection
     ' is required; geometry detection is automatic.
@@ -224,7 +227,9 @@ Sub Main()
         Logger.Info("Nibbing profile: " & NibProfile)
         Logger.Info("Minimum candidate edge length: " & MinimumNibEdgeLengthMM & " mm")
         Logger.Info("Minimum end clearance: " & MinimumNibEndClearanceMM & " mm")
-        Logger.Info("Maximum nib spacing: " & MaximumNibSpacingMM & " mm")
+        Logger.Info("Maximum nib centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
+        Logger.Info("Minimum usable nib edge length: " & MinimumUsableNibEdgeLengthMM & " mm")
+        Logger.Info("Minimum nib centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
         Logger.Warning("Analysis-only mode: no nibs will be inserted and no geometry will be changed.")
 
         ScanOccurrences( _
@@ -235,6 +240,8 @@ Sub Main()
             MinimumNibEdgeLengthMM, _
             MinimumNibEndClearanceMM, _
             MaximumNibSpacingMM, _
+            MinimumUsableNibEdgeLengthMM, _
+            MinimumNibCentreSeparationMM, _
             TotalOccurrences, _
             TotalParts, _
             SheetMetalParts, _
@@ -338,6 +345,8 @@ Sub ScanOccurrences( _
     MinimumNibEdgeLengthMM As Double, _
     MinimumNibEndClearanceMM As Double, _
     MaximumNibSpacingMM As Double, _
+    MinimumUsableNibEdgeLengthMM As Double, _
+    MinimumNibCentreSeparationMM As Double, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
     ByRef SheetMetalParts As Integer, _
@@ -441,6 +450,8 @@ Sub ScanOccurrences( _
                 MinimumNibEdgeLengthMM, _
                 MinimumNibEndClearanceMM, _
                 MaximumNibSpacingMM, _
+                MinimumUsableNibEdgeLengthMM, _
+                MinimumNibCentreSeparationMM, _
                 TotalOccurrences, _
                 TotalParts, _
                 SheetMetalParts, _
@@ -668,7 +679,9 @@ Sub ScanOccurrences( _
             PhysicalThicknessMM,
             MinimumNibEdgeLengthMM,
             MinimumNibEndClearanceMM,
-            MaximumNibSpacingMM)
+            MaximumNibSpacingMM, _
+            MinimumUsableNibEdgeLengthMM, _
+            MinimumNibCentreSeparationMM)
 
         ' Nib selection and insertion are intentionally not called.
 
@@ -708,7 +721,9 @@ Sub AnalyzePlateGeometry( _
     PhysicalThicknessMM As Double, _
     MinimumNibEdgeLengthMM As Double, _
     MinimumNibEndClearanceMM As Double, _
-    MaximumNibSpacingMM As Double)
+    MaximumNibSpacingMM As Double, _
+    MinimumUsableNibEdgeLengthMM As Double, _
+    MinimumNibCentreSeparationMM As Double)
 
     Logger.Section("NIB EDGE ANALYSIS")
     Logger.Info("Occurrence: " & OccurrenceName)
@@ -721,6 +736,9 @@ Sub AnalyzePlateGeometry( _
     ' One degree is a starting diagnostic tolerance, not an engineering standard.
     Dim OrientationToleranceDegrees As Double = 1.0
     Logger.Info("Edge orientation angular tolerance: " & OrientationToleranceDegrees & " degrees")
+    Logger.Info("Maximum centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
+    Logger.Info("Minimum usable edge length: " & MinimumUsableNibEdgeLengthMM & " mm")
+    Logger.Info("Minimum centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
 
     Dim PartDef As Inventor.PartComponentDefinition = Nothing
     Try
@@ -769,11 +787,12 @@ Sub AnalyzePlateGeometry( _
 
             PlanarFacesFound += 1
             Dim FaceArea As Double = TryGetFaceArea(Face)
+            Dim FaceAreaStatus As String = If(FaceArea > 0, "AREA AVAILABLE", "AREA UNAVAILABLE/ZERO")
             Dim LongBoundaryEdgeCount As Integer = CountLongBoundaryEdges( _
                 PartDoc, Face, ThicknessScaleThresholdMM)
 
             Logger.Debug("Body " & BodyIndex & ", face " & FaceIndex & _
-                         ": planar area=" & Math.Round(FaceArea, 3) & _
+                         ": planar area=" & Math.Round(FaceArea, 6) & " (database area units; " & FaceAreaStatus & ")" & _
                          "; boundary edges longer than " & _
                          Math.Round(ThicknessScaleThresholdMM, 3) & " mm=" & _
                          LongBoundaryEdgeCount)
@@ -802,8 +821,8 @@ Sub AnalyzePlateGeometry( _
 
         BodiesAnalysed += 1
         Logger.Info("Selected broad planar face on body " & BodyIndex & _
-                    "; area=" & Math.Round(Math.Max(0, BestFaceArea), 3) & _
-                    " database units squared; long boundary edges=" & _
+                    "; area=" & Math.Round(Math.Max(0, BestFaceArea), 6) & _
+                    " database area units (diagnostic/tie-break only); long boundary edges=" & _
                     BestLongBoundaryEdgeCount & "; edge loops=" & MainFace.EdgeLoops.Count)
 
         For Each BoundaryLoop As Inventor.EdgeLoop In MainFace.EdgeLoops
@@ -881,6 +900,9 @@ Sub AnalyzePlateGeometry( _
                 ElseIf EdgeLengthMM <= (2 * MinimumNibEndClearanceMM) Then
                     IsCandidate = False
                     Reason = "Insufficient length after end clearances"
+                ElseIf (EdgeLengthMM - (2 * MinimumNibEndClearanceMM)) < MinimumUsableNibEdgeLengthMM Then
+                    IsCandidate = False
+                    Reason = "Usable length after end clearances is below minimum usable edge length"
                 ElseIf NibProfile = "Internal openings - long edges only" AndAlso _
                        EdgeLengthMM < (LongestStraightEdgeMM * 0.75) Then
                     IsCandidate = False
@@ -897,20 +919,36 @@ Sub AnalyzePlateGeometry( _
                             " | " & Reason)
 
                 If IsCandidate Then
-                    CandidateEdges += 1
                     Dim UsableLengthMM As Double = EdgeLengthMM - (2 * MinimumNibEndClearanceMM)
+
+                    ' Use the smallest whole number of intervals that keeps every
+                    ' centre-to-centre gap at or below the maximum spacing.
+                    ' Then verify that the resulting equal spacing is not below
+                    ' the configured minimum separation.
                     Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
                     If IntervalCount < 1 Then IntervalCount = 1
                     Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
 
-                    Logger.Info("  Candidate positions from edge start (mm):")
-                    For PositionIndex As Integer = 0 To IntervalCount
-                        Dim PositionMM As Double = MinimumNibEndClearanceMM + (PositionIndex * ActualSpacingMM)
-                        Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
-                        CandidatePositions += 1
-                    Next
-                    Logger.Info("  Calculated spacing: " & Math.Round(ActualSpacingMM, 2) & _
-                                " mm; maximum allowed: " & MaximumNibSpacingMM & " mm")
+                    If ActualSpacingMM < MinimumNibCentreSeparationMM Then
+                        IsCandidate = False
+                        Reason = "Even distribution would violate minimum centre-to-centre separation (" & _
+                                 Math.Round(ActualSpacingMM, 2) & " mm < " & MinimumNibCentreSeparationMM & " mm)"
+                        RejectedEdges += 1
+                        Logger.Info("  REJECTED AFTER DISTRIBUTION CHECK: " & Reason)
+                    Else
+                        CandidateEdges += 1
+                        Logger.Info("  Candidate positions from edge start (mm):")
+                        For PositionIndex As Integer = 0 To IntervalCount
+                            Dim PositionMM As Double = MinimumNibEndClearanceMM + (PositionIndex * ActualSpacingMM)
+                            Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
+                            CandidatePositions += 1
+                        Next
+                        Logger.Info("  Usable length: " & Math.Round(UsableLengthMM, 2) & " mm")
+                        Logger.Info("  Nib centre count: " & (IntervalCount + 1))
+                        Logger.Info("  Actual centre-to-centre spacing: " & Math.Round(ActualSpacingMM, 2) & _
+                                    " mm; permitted range: " & MinimumNibCentreSeparationMM & " to " & _
+                                    MaximumNibSpacingMM & " mm")
+                    End If
                 Else
                     RejectedEdges += 1
                 End If
@@ -1026,9 +1064,16 @@ End Function
 
 
 Function TryGetFaceArea(Face As Inventor.Face) As Double
+    If Face Is Nothing Then Return 0
+
     Try
-        Return Face.Area
-    Catch
+        ' Face.Evaluator.Area is the Inventor SurfaceEvaluator area property.
+        ' Inventor database area units are cm^2. Face.Area is not used here,
+        ' because the evaluator is the documented geometry measurement route.
+        Dim FaceEvaluator As Inventor.SurfaceEvaluator = Face.Evaluator
+        Return FaceEvaluator.Area
+    Catch ex As Exception
+        Logger.Debug("Unable to retrieve planar face area from SurfaceEvaluator: " & ex.Message)
         Return 0
     End Try
 End Function
