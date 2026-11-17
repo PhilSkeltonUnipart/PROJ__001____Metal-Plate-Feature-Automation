@@ -1,9 +1,9 @@
 ' ============================================================
 ' INVENTOR NIB AUTOMATION
 '
-' Assembly / Plate Scanner + Nib Edge Analysis (analysis only)
+' Assembly / Plate Scanner + Nib Edge Analysis + Nib Orientation Preview
 '
-' Version: 0.4.7
+' Version: 0.4.8
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -17,11 +17,15 @@
 '   - Analyse internal openings and/or external boundaries using a selected profile
 '   - Use independent internal-opening and external-perimeter clearances / usable lengths
 '   - Calculate assembly-space candidate positions and display temporary client-graphics markers
+'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
+'   - Optionally add temporary nib preview occurrences to the active assembly
 '   - Reject edges with insufficient usable length or nib separation
 '   - Produce a centralised diagnostic log
 '
-' IMPORTANT: This version does NOT insert nibs or modify model geometry/constraints.
-' Temporary client graphics are displayed in the active assembly and are not saved with it.
+' IMPORTANT: This version does NOT modify plate solid geometry, sketches, features or constraints.
+' If preview is accepted, it adds separate temporary component occurrences of the nib part
+' to the active assembly. These are NOT combined with plates. Do not save the assembly
+' if you want to discard the preview occurrences. Temporary candidate markers remain client graphics.
 '
 ' ============================================================
 
@@ -56,6 +60,8 @@ Sub Main()
     ' after scanning. They are temporary ClientGraphics, not model features.
     Dim InternalMarkerCoordinates As New System.Collections.ArrayList
     Dim ExternalMarkerCoordinates As New System.Collections.ArrayList
+    Dim NibPreviewPlacements As New System.Collections.ArrayList
+    Dim NibReferenceFile As String = ""
     Dim RootAssemblyTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
 
     ' Ask for one profile per run. No individual edge selection
@@ -139,6 +145,13 @@ Sub Main()
             CType( _
                 ActiveDoc, _
                 Inventor.AssemblyDocument)
+
+        NibReferenceFile = ResolveNibReferenceFile(AssemblyDoc)
+        If String.IsNullOrWhiteSpace(NibReferenceFile) Then
+            Logger.Warning("Nib reference part was not selected. Edge analysis will run without nib preview placement data.")
+        Else
+            Logger.Info("Nib reference part: " & NibReferenceFile)
+        End If
 
 
         ' Ask for one profile per run, after confirming that an
@@ -242,7 +255,7 @@ Sub Main()
         Logger.Info("External minimum usable edge length: " & ExternalMinimumUsableLengthMM & " mm")
         Logger.Info("Internal minimum usable edge length: " & InternalMinimumUsableLengthMM & " mm")
         Logger.Info("Minimum nib centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
-        Logger.Warning("Analysis-only mode: no nibs will be inserted and no geometry will be changed.")
+        Logger.Warning("Preview mode: plate geometry will not be changed. Optional separate nib occurrences may be added to the assembly after analysis.")
 
         ScanOccurrences( _
             AssemblyDoc.ComponentDefinition.Occurrences, _
@@ -258,6 +271,7 @@ Sub Main()
             MinimumNibCentreSeparationMM, _
             InternalMarkerCoordinates, _
             ExternalMarkerCoordinates, _
+            NibPreviewPlacements, _
             RootAssemblyTransform, _
             TotalOccurrences, _
             TotalParts, _
@@ -268,6 +282,12 @@ Sub Main()
             SubAssemblies)
 
         DrawNibCandidateMarkers(AssemblyDoc, InternalMarkerCoordinates, ExternalMarkerCoordinates)
+
+        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso NibPreviewPlacements.Count > 0 Then
+            CreateNibPreviewOccurrences(AssemblyDoc, NibReferenceFile, NibPreviewPlacements)
+        Else
+            Logger.Warning("No nib preview occurrences created. Either no reference part was selected or no valid placement frames were calculated.")
+        End If
 
 
         ' ----------------------------------------------------
@@ -370,6 +390,7 @@ Sub ScanOccurrences( _
     MinimumNibCentreSeparationMM As Double, _
     InternalMarkerCoordinates As System.Collections.ArrayList, _
     ExternalMarkerCoordinates As System.Collections.ArrayList, _
+    NibPreviewPlacements As System.Collections.ArrayList, _
     ParentAssemblyTransform As Inventor.Matrix, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
@@ -482,6 +503,7 @@ Sub ScanOccurrences( _
                 MinimumNibCentreSeparationMM, _
                 InternalMarkerCoordinates, _
                 ExternalMarkerCoordinates, _
+                NibPreviewPlacements, _
                 CurrentOccurrenceTransform, _
                 TotalOccurrences, _
                 TotalParts, _
@@ -700,7 +722,7 @@ Sub ScanOccurrences( _
 
 
         ' ====================================================
-        ' NIB EDGE ANALYSIS (REPORT ONLY)
+        ' NIB EDGE ANALYSIS + PREVIEW PLACEMENT CALCULATION
         ' ====================================================
 
         AnalyzePlateGeometry( _
@@ -717,9 +739,10 @@ Sub ScanOccurrences( _
             InternalMinimumUsableLengthMM,
             MinimumNibCentreSeparationMM,
             InternalMarkerCoordinates,
-            ExternalMarkerCoordinates)
+            ExternalMarkerCoordinates,
+            NibPreviewPlacements)
 
-        ' Nib selection and insertion are intentionally not called.
+        ' Preview occurrences are separate components; plate solids are not changed.
 
 
     Next
@@ -732,7 +755,7 @@ End Sub
  ' ============================================================
 ' NIB EDGE ANALYSIS - REPORT ONLY
 '
-' Version 0.4.5: vector-angle edge orientation classification.
+' Version 0.4.8 retains vector-angle edge orientation classification and adds nib placement-frame preview.
 '
 ' Version 0.4.4 geometry strategy:
 '   - Identify the broad planar face, not merely any planar face.
@@ -746,7 +769,7 @@ End Sub
 '   - Apply the selected nib profile after geometric classification.
 '   - Use independent clearances for internal openings and external perimeters.
 '   - Transform calculated nib centres into assembly coordinates and draw temporary markers.
-'   - Calculate positions only; never insert nibs or modify assembly.
+'   - Calculate candidate positions and nib placement frames; optional preview occurrences are separate assembly components.
 '
 ' This is intended to handle rotated plates and angled outlines because
 ' it does not depend on global X/Y/Z directions or rectangular shapes.
@@ -766,7 +789,8 @@ Sub AnalyzePlateGeometry( _
     InternalMinimumUsableLengthMM As Double, _
     MinimumNibCentreSeparationMM As Double, _
     InternalMarkerCoordinates As System.Collections.ArrayList, _
-    ExternalMarkerCoordinates As System.Collections.ArrayList)
+    ExternalMarkerCoordinates As System.Collections.ArrayList, _
+    NibPreviewPlacements As System.Collections.ArrayList)
 
     Logger.Section("NIB EDGE ANALYSIS")
     Logger.Info("Occurrence: " & OccurrenceName)
@@ -998,6 +1022,9 @@ Sub AnalyzePlateGeometry( _
                                 AddCandidateMarkerCoordinate(PartDoc, StartVertex.Point, StopVertex.Point, _
                                     PositionMM, EdgeLengthMM, OccurrenceTransform, IsOuterLoop, _
                                     InternalMarkerCoordinates, ExternalMarkerCoordinates)
+                                AddNibPreviewPlacement(PartDoc, MainFace, BoundaryLoop, Edge, _
+                                    PositionMM, EdgeLengthMM, PhysicalThicknessMM, OccurrenceTransform, _
+                                    NibPreviewPlacements)
                             End If
                         Next
                         Logger.Info("  Boundary type: " & LoopType)
@@ -1022,10 +1049,215 @@ Sub AnalyzePlateGeometry( _
     Logger.Info("Candidate edges: " & CandidateEdges)
     Logger.Info("Rejected edges: " & RejectedEdges)
     Logger.Info("Calculated candidate positions: " & CandidatePositions)
-    Logger.Warning("Candidate positions were transformed into assembly-space temporary markers; no nibs were inserted and no model geometry was changed.")
+    Logger.Info("Calculated nib placement frames: " & NibPreviewPlacements.Count)
+    Logger.Warning("Plate solid geometry remains unchanged. If preview is accepted, separate nib component occurrences are added to the assembly for visual inspection.")
 
 End Sub
 
+
+
+' ============================================================
+' NIB REFERENCE FILE + ORIENTATION PREVIEW
+' ============================================================
+
+Function ResolveNibReferenceFile(AssemblyDoc As Inventor.AssemblyDocument) As String
+    If AssemblyDoc Is Nothing Then Return ""
+    Try
+        Dim AssemblyFolder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
+        Dim ExpectedPath As String = System.IO.Path.Combine(AssemblyFolder, "3mm-STD-NIB.ipt")
+        If System.IO.File.Exists(ExpectedPath) Then Return ExpectedPath
+    Catch
+    End Try
+
+    Dim Dialog As New System.Windows.Forms.OpenFileDialog
+    Dialog.Title = "Select the nib reference part"
+    Dialog.Filter = "Inventor Part (*.ipt)|*.ipt"
+    Dialog.FileName = "3mm-STD-NIB.ipt"
+    Dialog.CheckFileExists = True
+    If Dialog.ShowDialog() = System.Windows.Forms.DialogResult.OK Then
+        Return Dialog.FileName
+    End If
+    Return ""
+End Function
+
+Sub AddNibPreviewPlacement( _
+    PartDoc As Inventor.PartDocument, _
+    BroadFace As Inventor.Face, _
+    BoundaryLoop As Inventor.EdgeLoop, _
+    Edge As Inventor.Edge, _
+    DistanceAlongEdgeMM As Double, _
+    EdgeLengthMM As Double, _
+    PhysicalThicknessMM As Double, _
+    OccurrenceTransform As Inventor.Matrix, _
+    Placements As System.Collections.ArrayList)
+
+    Try
+        If PartDoc Is Nothing OrElse BroadFace Is Nothing OrElse BoundaryLoop Is Nothing OrElse Edge Is Nothing Then Exit Sub
+        If EdgeLengthMM <= 0 OrElse PhysicalThicknessMM <= 0 Then Exit Sub
+        If Not IsStraightEdge(Edge) Then Exit Sub
+        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Exit Sub
+
+        Dim Fraction As Double = DistanceAlongEdgeMM / EdgeLengthMM
+        If Fraction < 0 OrElse Fraction > 1 Then Exit Sub
+
+        Dim P0 As Inventor.Point = Edge.StartVertex.Point
+        Dim P1 As Inventor.Point = Edge.StopVertex.Point
+        Dim EdgePoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            P0.X + ((P1.X - P0.X) * Fraction), _
+            P0.Y + ((P1.Y - P0.Y) * Fraction), _
+            P0.Z + ((P1.Z - P0.Z) * Fraction))
+
+        Dim FacePlane As Inventor.Plane = CType(BroadFace.Geometry, Inventor.Plane)
+        Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            FacePlane.Normal.X, FacePlane.Normal.Y, FacePlane.Normal.Z)
+        ZAxis.Normalize()
+
+        Dim EdgeLine As Inventor.LineSegment = CType(Edge.Geometry, Inventor.LineSegment)
+        Dim Tangent As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            EdgeLine.Direction.X, EdgeLine.Direction.Y, EdgeLine.Direction.Z)
+        Tangent.Normalize()
+
+        ' Determine the direction away from plate material. For external loops,
+        ' use the vector from the broad-face interior towards the edge. For an
+        ' internal opening, use the vector from the edge towards that opening's loop centre.
+        Dim LoopCentre As Inventor.Point = GetBoundaryLoopCentre(BoundaryLoop)
+        Dim DesiredOutward As Inventor.Vector = Nothing
+        If BoundaryLoop.IsOuterEdgeLoop Then
+            ' The centroid of the outer boundary is used as a stable interior reference
+            ' for the common convex plate outlines handled by this first preview build.
+            Dim FaceInterior As Inventor.Point = LoopCentre
+            DesiredOutward = ThisApplication.TransientGeometry.CreateVector( _
+                EdgePoint.X - FaceInterior.X, EdgePoint.Y - FaceInterior.Y, EdgePoint.Z - FaceInterior.Z)
+        Else
+            DesiredOutward = ThisApplication.TransientGeometry.CreateVector( _
+                LoopCentre.X - EdgePoint.X, LoopCentre.Y - EdgePoint.Y, LoopCentre.Z - EdgePoint.Z)
+        End If
+
+        ' Remove any component parallel to the edge, then normalise.
+        Dim Along As Double = DesiredOutward.DotProduct(Tangent)
+        DesiredOutward.X = DesiredOutward.X - (Along * Tangent.X)
+        DesiredOutward.Y = DesiredOutward.Y - (Along * Tangent.Y)
+        DesiredOutward.Z = DesiredOutward.Z - (Along * Tangent.Z)
+        If DesiredOutward.Length < 0.000001 Then Exit Sub
+        DesiredOutward.Normalize()
+
+        ' Local nib axes: +Y points outwards; +Z follows the broad-face normal;
+        ' +X is selected to complete a right-handed frame.
+        Dim YAxis As Inventor.Vector = DesiredOutward
+        Dim XAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            (YAxis.Y * ZAxis.Z) - (YAxis.Z * ZAxis.Y), _
+            (YAxis.Z * ZAxis.X) - (YAxis.X * ZAxis.Z), _
+            (YAxis.X * ZAxis.Y) - (YAxis.Y * ZAxis.X))
+        If XAxis.Length < 0.000001 Then Exit Sub
+        XAxis.Normalize()
+
+        ' The selected broad face is one outer surface of the plate. Move half
+        ' the measured physical thickness inward to centre the nib through thickness.
+        Dim HalfThicknessCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits( _
+            PhysicalThicknessMM / 2.0, "mm", "cm")
+        Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            EdgePoint.X - (ZAxis.X * HalfThicknessCM), _
+            EdgePoint.Y - (ZAxis.Y * HalfThicknessCM), _
+            EdgePoint.Z - (ZAxis.Z * HalfThicknessCM))
+
+        ' Transform origin and axis endpoints into assembly coordinates.
+        Dim O As Inventor.Point = OriginPart.Copy()
+        O.TransformBy(OccurrenceTransform)
+        Dim XP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            OriginPart.X + XAxis.X, OriginPart.Y + XAxis.Y, OriginPart.Z + XAxis.Z)
+        XP.TransformBy(OccurrenceTransform)
+        Dim YP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            OriginPart.X + YAxis.X, OriginPart.Y + YAxis.Y, OriginPart.Z + YAxis.Z)
+        YP.TransformBy(OccurrenceTransform)
+        Dim ZP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            OriginPart.X + ZAxis.X, OriginPart.Y + ZAxis.Y, OriginPart.Z + ZAxis.Z)
+        ZP.TransformBy(OccurrenceTransform)
+
+        Dim AX As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(XP.X - O.X, XP.Y - O.Y, XP.Z - O.Z)
+        Dim AY As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(YP.X - O.X, YP.Y - O.Y, YP.Z - O.Z)
+        Dim AZ As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(ZP.X - O.X, ZP.Y - O.Y, ZP.Z - O.Z)
+        AX.Normalize() : AY.Normalize() : AZ.Normalize()
+
+        ' Store origin followed by the X, Y and Z basis vectors (assembly coordinates).
+        Placements.Add(New Double() {O.X, O.Y, O.Z, AX.X, AX.Y, AX.Z, AY.X, AY.Y, AY.Z, AZ.X, AZ.Y, AZ.Z})
+    Catch ex As Exception
+        Logger.Debug("Nib placement frame calculation failed: " & ex.Message)
+    End Try
+End Sub
+
+Function GetBoundaryLoopCentre(BoundaryLoop As Inventor.EdgeLoop) As Inventor.Point
+    Dim X As Double = 0, Y As Double = 0, Z As Double = 0
+    Dim Count As Integer = 0
+    For Each BoundaryEdge As Inventor.Edge In BoundaryLoop.Edges
+        If BoundaryEdge.StartVertex IsNot Nothing Then
+            X += BoundaryEdge.StartVertex.Point.X : Y += BoundaryEdge.StartVertex.Point.Y : Z += BoundaryEdge.StartVertex.Point.Z
+            Count += 1
+        End If
+    Next
+    If Count = 0 Then Return ThisApplication.TransientGeometry.CreatePoint(0, 0, 0)
+    Return ThisApplication.TransientGeometry.CreatePoint(X / Count, Y / Count, Z / Count)
+End Function
+
+Sub CreateNibPreviewOccurrences( _
+    AssemblyDoc As Inventor.AssemblyDocument, _
+    NibFilePath As String, _
+    Placements As System.Collections.ArrayList)
+
+    If AssemblyDoc Is Nothing OrElse Placements Is Nothing OrElse Placements.Count = 0 Then Exit Sub
+    Logger.Section("NIB ORIENTATION PREVIEW")
+    Logger.Info("Reference nib: " & NibFilePath)
+    Logger.Info("Nib local attachment plane: ZX")
+    Logger.Info("Nib local projection direction: +Y")
+    Logger.Info("Nib local +Y is aligned outwards from each selected plate boundary")
+    Logger.Info("Nib local +Z is aligned with the selected broad-face normal")
+    Logger.Info("Calculated placement frames: " & Placements.Count)
+    Logger.Warning("Preview creates separate component occurrences in the active assembly. It does not copy or combine geometry into the plates.")
+
+    Dim Answer As System.Windows.Forms.DialogResult = System.Windows.Forms.MessageBox.Show( _
+        "Create " & Placements.Count & " temporary nib preview occurrence(s) using 3mm-STD-NIB.ipt?" & vbCrLf & vbCrLf & _
+        "These are separate assembly components, not combined plate geometry. The assembly will be modified in memory. " & _
+        "Close without saving to discard the preview.", _
+        "Inventor Nib Automation - v0.4.8 Preview", _
+        System.Windows.Forms.MessageBoxButtons.YesNo, _
+        System.Windows.Forms.MessageBoxIcon.Question)
+    If Answer <> System.Windows.Forms.DialogResult.Yes Then
+        Logger.Info("User declined nib preview occurrence creation.")
+        Exit Sub
+    End If
+
+    Dim Created As Integer = 0
+    Dim Failed As Integer = 0
+    Dim PreviewLimit As Integer = 300
+    Dim CountToCreate As Integer = Math.Min(Placements.Count, PreviewLimit)
+    If Placements.Count > PreviewLimit Then
+        Logger.Warning("Preview limited to first " & PreviewLimit & " placements to avoid overwhelming the assembly graphics.")
+    End If
+
+    For i As Integer = 0 To CountToCreate - 1
+        Try
+            Dim Values() As Double = CType(Placements(i), Double())
+            Dim PlacementMatrix As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
+            Dim PlacementOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(Values(0), Values(1), Values(2))
+            Dim PlacementXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(3), Values(4), Values(5))
+            Dim PlacementYAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(6), Values(7), Values(8))
+            Dim PlacementZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(9), Values(10), Values(11))
+            PlacementMatrix.SetCoordinateSystem(PlacementOrigin, PlacementXAxis, PlacementYAxis, PlacementZAxis)
+            AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, PlacementMatrix)
+            Created += 1
+        Catch ex As Exception
+            Failed += 1
+            Logger.Debug("Preview occurrence " & (i + 1) & " failed: " & ex.Message)
+        End Try
+    Next
+
+    Try
+        ThisApplication.ActiveView.Update()
+    Catch
+    End Try
+    Logger.Success("Nib preview occurrences created: " & Created)
+    If Failed > 0 Then Logger.Warning("Nib preview occurrence failures: " & Failed)
+    Logger.Warning("Review the preview visually. Do not save the assembly if you want to discard all temporary preview occurrences.")
+End Sub
 
 ' ============================================================
 ' TEMPORARY CANDIDATE MARKER GRAPHICS
@@ -1074,7 +1306,7 @@ Sub DrawNibCandidateMarkers( _
 
     If AssemblyDoc Is Nothing Then Exit Sub
 
-    Const GraphicsId As String = "InventorNibAutomation_v047_CandidateMarkers"
+    Const GraphicsId As String = "InventorNibAutomation_v048_CandidateMarkers"
     Try
         ' Remove markers from a previous run of this rule, if present.
         Try
@@ -2056,4 +2288,3 @@ Class Logger
 
 
 End Class
-
