@@ -3,7 +3,7 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis + Corrected Nib Orientation Preview
 '
-' Version: 0.4.8.1
+' Version: 0.4.8.2
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -756,7 +756,7 @@ End Sub
  ' ============================================================
 ' NIB EDGE ANALYSIS - REPORT ONLY
 '
-' Version 0.4.8.1 retains vector-angle edge orientation classification and adds nib placement-frame preview.
+' Version 0.4.8.2 retains the corrected 90-degree nib orientation and fixes the plate-thickness centring offset.
 '
 ' Version 0.4.4 geometry strategy:
 '   - Identify the broad planar face, not merely any planar face.
@@ -1165,14 +1165,17 @@ Sub AddNibPreviewPlacement( _
         XAxis.Normalize()
         ZAxis.Normalize()
 
-        ' The selected broad face is one outer surface of the plate. Move half
-        ' the measured physical thickness inward to centre the nib through thickness.
+        ' After the 90-degree roll, local +X is aligned with the selected
+        ' broad-face normal. Move half the measured physical thickness inward
+        ' along that broad-face normal so the nib remains centred across the
+        ' plate's thin edge. Do not use local Z here: local Z now follows the
+        ' plate-edge direction.
         Dim HalfThicknessCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits( _
             PhysicalThicknessMM / 2.0, "mm", "cm")
         Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            EdgePoint.X - (ZAxis.X * HalfThicknessCM), _
-            EdgePoint.Y - (ZAxis.Y * HalfThicknessCM), _
-            EdgePoint.Z - (ZAxis.Z * HalfThicknessCM))
+            EdgePoint.X - (XAxis.X * HalfThicknessCM), _
+            EdgePoint.Y - (XAxis.Y * HalfThicknessCM), _
+            EdgePoint.Z - (XAxis.Z * HalfThicknessCM))
 
         ' Transform origin and axis endpoints into assembly coordinates.
         Dim O As Inventor.Point = OriginPart.Copy()
@@ -1233,7 +1236,7 @@ Sub CreateNibPreviewOccurrences( _
         "Create " & Placements.Count & " temporary nib preview occurrence(s) using 3mm-STD-NIB.ipt?" & vbCrLf & vbCrLf & _
         "These are separate assembly components, not combined plate geometry. The assembly will be modified in memory. " & _
         "Close without saving to discard the preview.", _
-        "Inventor Nib Automation - v0.4.8.1 Preview", _
+        "Inventor Nib Automation - v0.4.8.2 Preview", _
         System.Windows.Forms.MessageBoxButtons.YesNo, _
         System.Windows.Forms.MessageBoxIcon.Question)
     If Answer <> System.Windows.Forms.DialogResult.Yes Then
