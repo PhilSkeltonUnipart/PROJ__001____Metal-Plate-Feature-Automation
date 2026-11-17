@@ -1,9 +1,9 @@
 ' ============================================================
 ' INVENTOR NIB AUTOMATION
 '
-' Assembly / Plate Scanner + Nib Edge Analysis + Nib Orientation Preview
+' Assembly / Plate Scanner + Nib Edge Analysis + Corrected Nib Orientation Preview
 '
-' Version: 0.4.8
+' Version: 0.4.8.1
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -18,6 +18,7 @@
 '   - Use independent internal-opening and external-perimeter clearances / usable lengths
 '   - Calculate assembly-space candidate positions and display temporary client-graphics markers
 '   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
+'   - Apply a 90-degree roll correction about the nib local +Y projection axis
 '   - Optionally add temporary nib preview occurrences to the active assembly
 '   - Reject edges with insufficient usable length or nib separation
 '   - Produce a centralised diagnostic log
@@ -755,7 +756,7 @@ End Sub
  ' ============================================================
 ' NIB EDGE ANALYSIS - REPORT ONLY
 '
-' Version 0.4.8 retains vector-angle edge orientation classification and adds nib placement-frame preview.
+' Version 0.4.8.1 retains vector-angle edge orientation classification and adds nib placement-frame preview.
 '
 ' Version 0.4.4 geometry strategy:
 '   - Identify the broad planar face, not merely any planar face.
@@ -1141,15 +1142,28 @@ Sub AddNibPreviewPlacement( _
         If DesiredOutward.Length < 0.000001 Then Exit Sub
         DesiredOutward.Normalize()
 
-        ' Local nib axes: +Y points outwards; +Z follows the broad-face normal;
-        ' +X is selected to complete a right-handed frame.
+        ' Initial right-handed frame: local +Y points outwards from the plate.
+        ' The first preview showed the nib profile rolled 90 degrees relative
+        ' to the plate. Correct this by rolling the nib 90 degrees about its
+        ' own +Y projection axis. This keeps the ZX attachment plane normal
+        ' aligned with the outward direction while swapping the two in-plane
+        ' axes. The resulting local +X follows the broad-face normal and local
+        ' +Z follows the plate-edge direction (with sign set for a right-handed frame).
         Dim YAxis As Inventor.Vector = DesiredOutward
-        Dim XAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+        Dim InitialXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             (YAxis.Y * ZAxis.Z) - (YAxis.Z * ZAxis.Y), _
             (YAxis.Z * ZAxis.X) - (YAxis.X * ZAxis.Z), _
             (YAxis.X * ZAxis.Y) - (YAxis.Y * ZAxis.X))
-        If XAxis.Length < 0.000001 Then Exit Sub
+        If InitialXAxis.Length < 0.000001 Then Exit Sub
+        InitialXAxis.Normalize()
+
+        ' 90-degree roll about local +Y: X(new)=Z(old), Z(new)=-X(old).
+        Dim XAxis As Inventor.Vector = ZAxis.Copy()
+        Dim CorrectedZAxis As Inventor.Vector = InitialXAxis.Copy()
+        CorrectedZAxis.ScaleBy(-1.0)
+        ZAxis = CorrectedZAxis
         XAxis.Normalize()
+        ZAxis.Normalize()
 
         ' The selected broad face is one outer surface of the plate. Move half
         ' the measured physical thickness inward to centre the nib through thickness.
@@ -1209,7 +1223,9 @@ Sub CreateNibPreviewOccurrences( _
     Logger.Info("Nib local attachment plane: ZX")
     Logger.Info("Nib local projection direction: +Y")
     Logger.Info("Nib local +Y is aligned outwards from each selected plate boundary")
-    Logger.Info("Nib local +Z is aligned with the selected broad-face normal")
+    Logger.Info("Orientation correction: 90-degree roll about local +Y")
+    Logger.Info("Nib local +X is aligned with the selected broad-face normal")
+    Logger.Info("Nib local +Z is aligned along the selected plate edge")
     Logger.Info("Calculated placement frames: " & Placements.Count)
     Logger.Warning("Preview creates separate component occurrences in the active assembly. It does not copy or combine geometry into the plates.")
 
@@ -1217,7 +1233,7 @@ Sub CreateNibPreviewOccurrences( _
         "Create " & Placements.Count & " temporary nib preview occurrence(s) using 3mm-STD-NIB.ipt?" & vbCrLf & vbCrLf & _
         "These are separate assembly components, not combined plate geometry. The assembly will be modified in memory. " & _
         "Close without saving to discard the preview.", _
-        "Inventor Nib Automation - v0.4.8 Preview", _
+        "Inventor Nib Automation - v0.4.8.1 Preview", _
         System.Windows.Forms.MessageBoxButtons.YesNo, _
         System.Windows.Forms.MessageBoxIcon.Question)
     If Answer <> System.Windows.Forms.DialogResult.Yes Then
