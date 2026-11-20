@@ -5,6 +5,7 @@ Sub Main()
 
     Dim oPlates As New List(Of ComponentOccurrence)
     Dim oNibs As New List(Of ComponentOccurrence)
+    Dim oNibsToSuppress As New HashSet(Of ComponentOccurrence)
 
     ' 1. Sort top-level occurrences into Plates and Nibs
     For Each oOcc As ComponentOccurrence In oAsmDoc.ComponentDefinition.Occurrences
@@ -67,6 +68,7 @@ Sub Main()
                 ' Case A: Came in as a true solid body -> queue for Combine
                 If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
                     oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+                    oNibsToSuppress.Add(oNib)
 
                 ' Case B: Came in as a WorkSurface -> wrap in SculptSurface and Join to Plate
                 ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
@@ -78,6 +80,7 @@ Sub Main()
                     oSculptCol.Add(oSculptSurf)
 
                     oSculptFeats.Add(oSculptCol, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
+                    oNibsToSuppress.Add(oNib)
                 End If
             End If
         Next
@@ -87,13 +90,19 @@ Sub Main()
             oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
         End If
 
-        ' 4. Force the Sheet Metal / Part document to compute the new Sculpt features immediately
+        ' 4. Force the Sheet Metal / Part document to compute the new features immediately
         If plateModified Then
             oPlateDoc.Update2(True)
         End If
     Next
 
-    oAsmDoc.Update2(True)
-    MessageBox.Show("Done!", "iLogic")
-End Sub
+    ' 5. Suppress all matched 3mm-STD-NIB occurrences in the assembly
+    For Each oNibToSuppress As ComponentOccurrence In oNibsToSuppress
+        If Not oNibToSuppress.Suppressed Then
+            oNibToSuppress.Suppress()
+        End If
+    Next
 
+    oAsmDoc.Update2(True)
+    MessageBox.Show("Done! Merged and suppressed " & oNibsToSuppress.Count & " nib(s).", "iLogic")
+End Sub
