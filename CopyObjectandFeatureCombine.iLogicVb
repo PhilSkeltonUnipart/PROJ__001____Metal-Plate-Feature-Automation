@@ -1,13 +1,16 @@
 Sub Main()
-    Dim oAsmDoc As AssemblyDocument = ThisApplication.ActiveDocument
-    Dim oTO As TransientObjects = ThisApplication.TransientObjects
-    Dim oTBRep As TransientBRep = ThisApplication.TransientBRep
+    Dim oApp As Inventor.Application = ThisApplication
+    Dim oAsmDoc As AssemblyDocument = TryCast(oApp.ActiveDocument, AssemblyDocument)
+    If oAsmDoc Is Nothing Then Exit Sub
+
+    Dim oTO As TransientObjects = oApp.TransientObjects
+    Dim oTBRep As TransientBRep = oApp.TransientBRep
 
     Dim oPlates As New List(Of ComponentOccurrence)
     Dim oNibs As New List(Of ComponentOccurrence)
     Dim oNibsToDelete As New HashSet(Of ComponentOccurrence)
 
-    ' 1. Sort top-level occurrences into Plates (4 or 5 leading digits) and Nibs
+    ' 1. Sort top-level occurrences into Plates and Nibs
     For Each oOcc As ComponentOccurrence In oAsmDoc.ComponentDefinition.Occurrences
         If oOcc.Suppressed Then Continue For
         Dim fName As String = System.IO.Path.GetFileNameWithoutExtension(oOcc.Definition.Document.FullFileName)
@@ -19,89 +22,128 @@ Sub Main()
         End If
     Next
 
-    ' 2. Check each plate against each nib
-    For Each oPlate As ComponentOccurrence In oPlates
-        Dim oPlateDef As PartComponentDefinition = oPlate.Definition
-        Dim oPlateDoc As PartDocument = oPlateDef.Document
-        Dim oBaseBody As SurfaceBody = oPlateDef.SurfaceBodies.Item(1)
-        Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
-        Dim plateModified As Boolean = False
+    If oPlates.Count = 0 OrElse oNibs.Count = 0 Then
+        MessageBox.Show("No matching plates or nibs found.", "iLogic")
+        Exit Sub
+    End If
 
-        ' Get inverse matrix of the plate
-        Dim oPlateInvMatrix As Matrix = oPlate.Transformation
-        oPlateInvMatrix.Invert()
+    ' Wrap entire operation in a single Undo Transaction and pause graphics/UI updates
+    Dim oTrans As Transaction = oApp.TransactionManager.StartTransaction(oAsmDoc, "Merge & Delete Nibs")
+    oApp.ScreenUpdating = False
+    oApp.UserInterfaceManager.UserInteractionDisabled = True
 
-        For Each oNib As ComponentOccurrence In oNibs
-            Dim oCheckSet1 As ObjectCollection = oTO.CreateObjectCollection()
-            Dim oCheckSet2 As ObjectCollection = oTO.CreateObjectCollection()
-            oCheckSet1.Add(oPlate)
-            oCheckSet2.Add(oNib)
+    Try
+        ' Cache native nib solid body once instead of fetching on every loop
+        Dim oNativeNibBody As SurfaceBody = oNibs(0).Definition.SurfaceBodies.Item(1)
 
-            Dim oResults As InterferenceResults = oAsmDoc.ComponentDefinition.AnalyzeInterference(oCheckSet1, oCheckSet2)
+        ' Track remaining nibs so already-matched nibs aren't checked against subsequent plates
+        Dim oRemainingNibs As New List(Of ComponentOccurrence)(oNibs)
 
-            If oResults.Count > 0 Then
-                ' Grab native solid body and copy it
-                Dim oNativeNibBody As SurfaceBody = oNib.Definition.SurfaceBodies.Item(1)
-                Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNativeNibBody)
+        ' 2. Process each plate
+        For Each oPlate As ComponentOccurrence In oPlates
+            Dim oPlateBox As Box = oPlate.RangeBox
+            Dim oCandidateNibs As New List(Of ComponentOccurrence)
 
-                ' Transform from Nib local space -> Assembly space -> Plate local space
-                oTBRep.Transform(oCopiedBody, oNib.Transformation)
-                oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
+            ' Fast A: Axis-Aligned Bounding Box (RangeBox) filter in memory (microseconds)
+            For Each oNib As ComponentOccurrence In oRemainingNibs
+                If Not oPlateBox.Disjoint(oNib.RangeBox) Then
+                    oCandidateNibs.Add(oNib)
+                End If
+            Next
 
-                ' Track WorkSurface count before inserting base feature
-                Dim surfCountBefore As Integer = oPlateDef.WorkSurfaces.Count
+            If oCandidateNibs.Count = 0 Then Continue For
 
-                ' Insert as a Non-Parametric Base Feature
-                Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
-                Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
-                Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
-                oInputCol.Add(oCopiedBody)
+            Dim oPlateDef As PartComponentDefinition = oPlate.Definition
+            Dim oPlateDoc As PartDocument = oPlateDef.Document
+            Dim oBaseBody As SurfaceBody = oPlateDef.SurfaceBodies.Item(1)
 
-                oDef.BRepEntities = oInputCol
-                oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
-                oDef.IsAssociative = False
-                oDef.DeleteOriginal = True
+            Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
+            Dim oSculptCol As ObjectCollection = oTO.CreateObjectCollection()
+            Dim oSculptFeats As SculptFeatures = oPlateDef.Features.SculptFeatures
+            Dim plateModified As Boolean = False
 
-                Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
-                plateModified = True
+            ' Invert plate matrix once per plate
+            Dim oPlateInvMatrix As Matrix = oPlate.Transformation
+            oPlateInvMatrix.Invert()
 
-                ' Case A: Came in as a true solid body -> queue for Combine
-                If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
-                    oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
-                    oNibsToDelete.Add(oNib)
+            ' Fast B: Run exact interference check ONLY on bounding-box candidates
+            For Each oNib As ComponentOccurrence In oCandidateNibs
+                Dim oCheckSet1 As ObjectCollection = oTO.CreateObjectCollection()
+                Dim oCheckSet2 As ObjectCollection = oTO.CreateObjectCollection()
+                oCheckSet1.Add(oPlate)
+                oCheckSet2.Add(oNib)
 
-                ' Case B: Came in as a WorkSurface -> wrap in SculptSurface and Join to Plate
-                ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
-                    Dim oNewestWorkSurf As WorkSurface = oPlateDef.WorkSurfaces.Item(oPlateDef.WorkSurfaces.Count)
-                    Dim oSculptFeats As SculptFeatures = oPlateDef.Features.SculptFeatures
-                    Dim oSculptSurf As SculptSurface = oSculptFeats.CreateSculptSurface(oNewestWorkSurf, PartFeatureExtentDirectionEnum.kNegativeExtentDirection)
+                Dim oResults As InterferenceResults = oAsmDoc.ComponentDefinition.AnalyzeInterference(oCheckSet1, oCheckSet2)
 
-                    Dim oSculptCol As ObjectCollection = oTO.CreateObjectCollection()
-                    oSculptCol.Add(oSculptSurf)
+                If oResults.Count > 0 Then
+                    Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNativeNibBody)
+                    oTBRep.Transform(oCopiedBody, oNib.Transformation)
+                    oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
 
-                    oSculptFeats.Add(oSculptCol, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
+                    Dim surfCountBefore As Integer = oPlateDef.WorkSurfaces.Count
+
+                    Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
+                    Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
+                    Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
+                    oInputCol.Add(oCopiedBody)
+
+                    oDef.BRepEntities = oInputCol
+                    oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
+                    oDef.IsAssociative = False
+                    oDef.DeleteOriginal = True
+
+                    Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
+                    plateModified = True
+
+                    If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
+                        oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+                    ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
+                        Dim oNewestWorkSurf As WorkSurface = oPlateDef.WorkSurfaces.Item(oPlateDef.WorkSurfaces.Count)
+                        Dim oSculptSurf As SculptSurface = oSculptFeats.CreateSculptSurface(oNewestWorkSurf, PartFeatureExtentDirectionEnum.kNegativeExtentDirection)
+                        oSculptCol.Add(oSculptSurf)
+                    End If
+
                     oNibsToDelete.Add(oNib)
                 End If
+            Next
+
+            ' Remove matched nibs from pool so later plates skip them completely
+            For Each oMatchedNib As ComponentOccurrence In oNibsToDelete
+                oRemainingNibs.Remove(oMatchedNib)
+            Next
+
+            ' 3. Batch-join all solids and surfaces for this plate in single features
+            If oToolBodies.Count > 0 Then
+                oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
+            End If
+
+            If oSculptCol.Count > 0 Then
+                oSculptFeats.Add(oSculptCol, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
+            End If
+
+            ' 4. Single rebuild per plate instead of per nib
+            If plateModified Then
+                oPlateDoc.Update2(True)
             End If
         Next
 
-        ' 3. Combine any nibs that came in directly as solids
-        If oToolBodies.Count > 0 Then
-            oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
-        End If
+        ' 5. Delete all matched nibs from the assembly
+        Dim deletedCount As Integer = oNibsToDelete.Count
+        For Each oNibToDelete As ComponentOccurrence In oNibsToDelete
+            oNibToDelete.Delete()
+        Next
 
-        ' 4. Force the Sheet Metal / Part document to compute the new features immediately
-        If plateModified Then
-            oPlateDoc.Update2(True)
-        End If
-    Next
+        oAsmDoc.Update2(True)
+        oTrans.End()
 
-    ' 5. Delete all matched 3mm-STD-NIB occurrences from the assembly
-    Dim deletedCount As Integer = oNibsToDelete.Count
-    For Each oNibToDelete As ComponentOccurrence In oNibsToDelete
-        oNibToDelete.Delete()
-    Next
+        oApp.UserInterfaceManager.UserInteractionDisabled = False
+        oApp.ScreenUpdating = True
+        MessageBox.Show("Done! Merged and deleted " & deletedCount & " nib(s).", "iLogic")
 
-    oAsmDoc.Update2(True)
-    MessageBox.Show("Done! Merged and deleted " & deletedCount & " nib(s).", "iLogic")
+    Catch ex As Exception
+        oTrans.Abort()
+        oApp.UserInterfaceManager.UserInteractionDisabled = False
+        oApp.ScreenUpdating = True
+        MessageBox.Show("Error: " & ex.Message, "iLogic")
+    End Try
 End Sub
