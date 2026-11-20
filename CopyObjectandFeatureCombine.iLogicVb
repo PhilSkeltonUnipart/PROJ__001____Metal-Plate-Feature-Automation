@@ -45,6 +45,9 @@ Sub Main()
                 oTBRep.Transform(oCopiedBody, oNib.Transformation)
                 oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
 
+                ' Track WorkSurface count before inserting base feature
+                Dim surfCountBefore As Integer = oPlateDef.WorkSurfaces.Count
+
                 ' Insert as a Non-Parametric Base Feature
                 Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
                 Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
@@ -58,16 +61,20 @@ Sub Main()
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
 
-                ' Check if Inventor created a solid body or a closed work surface
+                ' Case A: Came in as a true solid body -> queue for Combine
                 If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
                     oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
-                ElseIf oNewFeat.Faces.Count > 0 Then
-                    ' Convert the closed surface into a solid and join it directly to the plate via Sculpt
-                    Dim oSculptSurfaces As ObjectCollection = oTO.CreateObjectCollection()
-                    Dim oWorkSurf As WorkSurface = oNewFeat.Faces.Item(1).Parent
-                    oSculptSurfaces.Add(oWorkSurf)
 
-                    oPlateDef.Features.SculptFeatures.Add(oSculptSurfaces, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
+                ' Case B: Came in as a WorkSurface -> wrap in SculptSurface and Join to Plate
+                ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
+                    Dim oNewestWorkSurf As WorkSurface = oPlateDef.WorkSurfaces.Item(oPlateDef.WorkSurfaces.Count)
+                    Dim oSculptFeats As SculptFeatures = oPlateDef.Features.SculptFeatures
+                    Dim oSculptSurf As SculptSurface = oSculptFeats.CreateSculptSurface(oNewestWorkSurf, PartFeatureExtentDirectionEnum.kPositiveExtentDirection)
+
+                    Dim oSculptCol As ObjectCollection = oTO.CreateObjectCollection()
+                    oSculptCol.Add(oSculptSurf)
+
+                    oSculptFeats.Add(oSculptCol, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
                 End If
             End If
         Next
