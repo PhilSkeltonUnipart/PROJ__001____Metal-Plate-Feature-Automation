@@ -1,0 +1,66 @@
+Sub Main()
+    Dim oAsmDoc As AssemblyDocument = TryCast(ThisApplication.ActiveDocument, AssemblyDocument)
+    If oAsmDoc Is Nothing Then
+        MessageBox.Show("Please run this rule from an Assembly document.", "iLogic")
+        Exit Sub
+    End If
+
+    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim oTO As TransientObjects = ThisApplication.TransientObjects
+
+    ' 1. Pick the Source Occurrence (body to copy) and Target Occurrence (part to receive & combine)
+    Dim oSourceOcc As ComponentOccurrence = ThisApplication.CommandManager.Pick(
+        SelectionFilterEnum.kAssemblyLeafOccurrenceFilter, "Select SOURCE part (body to copy)")
+    If oSourceOcc Is Nothing Then Exit Sub
+
+    Dim oTargetOcc As ComponentOccurrence = ThisApplication.CommandManager.Pick(
+        SelectionFilterEnum.kAssemblyLeafOccurrenceFilter, "Select TARGET part (to copy into and combine)")
+    If oTargetOcc Is Nothing Then Exit Sub
+
+    Dim oTargetDef As PartComponentDefinition = oTargetOcc.Definition
+
+    ' Ensure the target part already has a base body to combine with
+    If oTargetDef.SurfaceBodies.Count = 0 Then
+        MessageBox.Show("Target part must contain at least one solid body.", "iLogic")
+        Exit Sub
+    End If
+    Dim oBaseBody As SurfaceBody = oTargetDef.SurfaceBodies.Item(1)
+
+    ' 2. Copy the source body (SurfaceBodyProxy automatically captures assembly transform)
+    Dim oSourceBodyProxy As SurfaceBodyProxy = oSourceOcc.SurfaceBodies.Item(1)
+    Dim oCopiedTransientBody As SurfaceBody = ThisApplication.TransientBRep.Copy(oSourceBodyProxy)
+
+    ' Transform the transient body from Assembly space into the Target Part's local coordinate space
+    Dim oTargetTransform As Matrix = oTargetOcc.Transformation
+    oTargetTransform.Invert()
+    ThisApplication.TransientBRep.Transform(oCopiedTransientBody, oTargetTransform)
+
+    ' 3. Insert the copied body into the Target Part as a Non-Parametric Base Feature
+    Dim oBaseFeats As NonParametricBaseFeatures = oTargetDef.Features.NonParametricBaseFeatures
+    Dim oBaseFeatDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
+
+    Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
+    oInputCol.Add(oCopiedTransientBody)
+
+    oBaseFeatDef.BRepEntities = oInputCol
+    oBaseFeatDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
+    oBaseFeatDef.IsAssociative = False
+
+    Dim oNewBaseFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oBaseFeatDef)
+    Dim oToolBody As SurfaceBody = oNewBaseFeat.SurfaceBodies.Item(1)
+
+    ' 4. Combine the Base Body and the newly copied Tool Body
+    Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
+    oToolBodies.Add(oToolBody)
+
+    ' Operation options: kJoinOperation, kCutOperation, kIntersectOperation
+    Dim oCombineFeat As CombineFeature = oTargetDef.Features.CombineFeatures.Add(
+        oBaseBody,
+        oToolBodies,
+        PartFeatureOperationEnum.kJoinOperation,
+        False ' KeepToolBodies = False
+    )
+
+    oAsmDoc.Update()
+    MessageBox.Show("Copy and Combine complete!", "iLogic")
+End Sub
