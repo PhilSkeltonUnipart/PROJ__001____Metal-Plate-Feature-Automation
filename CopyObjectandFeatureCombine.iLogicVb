@@ -41,12 +41,11 @@ Sub Main()
                 Dim oNativeNibBody As SurfaceBody = oNib.Definition.SurfaceBodies.Item(1)
                 Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNativeNibBody)
 
-                ' Step A: Move nib from its local origin into Assembly space
+                ' Transform from Nib local space -> Assembly space -> Plate local space
                 oTBRep.Transform(oCopiedBody, oNib.Transformation)
-                ' Step B: Move nib from Assembly space into Plate's local space
                 oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
 
-                ' Insert as a Solid Base Feature
+                ' Insert as a Solid Base Feature using TargetOccurrence
                 Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
                 Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
                 Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
@@ -56,19 +55,10 @@ Sub Main()
                 oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
                 oDef.IsAssociative = False
                 oDef.DeleteOriginal = True
+                oDef.TargetOccurrence = oPlate
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
-
-                ' Check if it came in as a solid; if not, stitch its faces into a solid
-                Dim oResultBody As SurfaceBody = oNewFeat.SurfaceBodies.Item(1)
-                If oResultBody.IsSolid Then
-                    oToolBodies.Add(oResultBody)
-                Else
-                    Dim oSurfCol As ObjectCollection = oTO.CreateObjectCollection()
-                    oSurfCol.Add(oResultBody)
-                    Dim oKnit As KnitFeature = oPlateDef.Features.KnitFeatures.Add(oSurfCol)
-                    oToolBodies.Add(oKnit.SurfaceBodies.Item(1))
-                End If
+                oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
             End If
         Next
 
@@ -81,4 +71,3 @@ Sub Main()
     oAsmDoc.Update()
     MessageBox.Show("Done!", "iLogic")
 End Sub
-
