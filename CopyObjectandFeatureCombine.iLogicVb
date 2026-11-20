@@ -37,14 +37,14 @@ Sub Main()
             Dim oResults As InterferenceResults = oAsmDoc.ComponentDefinition.AnalyzeInterference(oCheckSet1, oCheckSet2)
 
             If oResults.Count > 0 Then
-                ' Grab the native solid body from the Nib's PartDefinition
+                ' Grab native solid body and copy it
                 Dim oNativeNibBody As SurfaceBody = oNib.Definition.SurfaceBodies.Item(1)
                 Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNativeNibBody)
 
-                ' Calculate exact relative transform: Plate^-1 * Nib
-                Dim oRelativeMatrix As Matrix = oPlateInvMatrix.Copy()
-                oRelativeMatrix.TransformBy(oNib.Transformation)
-                oTBRep.Transform(oCopiedBody, oRelativeMatrix)
+                ' Step A: Move nib from its local origin into Assembly space
+                oTBRep.Transform(oCopiedBody, oNib.Transformation)
+                ' Step B: Move nib from Assembly space into Plate's local space
+                oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
 
                 ' Insert as a Solid Base Feature
                 Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
@@ -55,12 +55,19 @@ Sub Main()
                 oDef.BRepEntities = oInputCol
                 oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
                 oDef.IsAssociative = False
+                oDef.DeleteOriginal = True
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
-                
-                ' Verify it created a solid before adding to Combine
-                If oNewFeat.SurfaceBodies.Item(1).IsSolid Then
-                    oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+
+                ' Check if it came in as a solid; if not, stitch its faces into a solid
+                Dim oResultBody As SurfaceBody = oNewFeat.SurfaceBodies.Item(1)
+                If oResultBody.IsSolid Then
+                    oToolBodies.Add(oResultBody)
+                Else
+                    Dim oSurfCol As ObjectCollection = oTO.CreateObjectCollection()
+                    oSurfCol.Add(oResultBody)
+                    Dim oKnit As KnitFeature = oPlateDef.Features.KnitFeatures.Add(oSurfCol)
+                    oToolBodies.Add(oKnit.SurfaceBodies.Item(1))
                 End If
             End If
         Next
