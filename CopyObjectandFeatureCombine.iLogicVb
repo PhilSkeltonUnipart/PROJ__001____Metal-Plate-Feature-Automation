@@ -44,9 +44,15 @@ Sub Main()
             Dim oPlateBox As Box = oPlate.RangeBox
             Dim oCandidateNibs As New List(Of ComponentOccurrence)
 
-            ' Fast A: Axis-Aligned Bounding Box (RangeBox) filter in memory (microseconds)
+            ' Fast A: Axis-Aligned Bounding Box (MinPoint / MaxPoint) filter in memory
             For Each oNib As ComponentOccurrence In oRemainingNibs
-                If Not oPlateBox.Disjoint(oNib.RangeBox) Then
+                Dim oNibBox As Box = oNib.RangeBox
+                Dim boxesOverlap As Boolean =
+                    (oPlateBox.MinPoint.X <= oNibBox.MaxPoint.X AndAlso oPlateBox.MaxPoint.X >= oNibBox.MinPoint.X) AndAlso
+                    (oPlateBox.MinPoint.Y <= oNibBox.MaxPoint.Y AndAlso oPlateBox.MaxPoint.Y >= oNibBox.MinPoint.Y) AndAlso
+                    (oPlateBox.MinPoint.Z <= oNibBox.MaxPoint.Z AndAlso oPlateBox.MaxPoint.Z >= oNibBox.MinPoint.Z)
+
+                If boxesOverlap Then
                     oCandidateNibs.Add(oNib)
                 End If
             Next
