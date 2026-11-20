@@ -6,7 +6,7 @@ Sub Main()
     Dim oPlates As New List(Of ComponentOccurrence)
     Dim oNibs As New List(Of ComponentOccurrence)
 
-    ' 1. Sort all occurrences into Plates and Nibs by file name
+    ' 1. Sort top-level occurrences into Plates and Nibs
     For Each oOcc As ComponentOccurrence In oAsmDoc.ComponentDefinition.Occurrences
         If oOcc.Suppressed Then Continue For
         Dim fName As String = System.IO.Path.GetFileNameWithoutExtension(oOcc.Definition.Document.FullFileName)
@@ -24,12 +24,11 @@ Sub Main()
         Dim oBaseBody As SurfaceBody = oPlateDef.SurfaceBodies.Item(1)
         Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
 
-        ' Get inverse matrix to convert assembly coordinates into this plate's local space
-        Dim oInvMatrix As Matrix = oPlate.Transformation
-        oInvMatrix.Invert()
+        ' Get inverse matrix of the plate
+        Dim oPlateInvMatrix As Matrix = oPlate.Transformation
+        oPlateInvMatrix.Invert()
 
         For Each oNib As ComponentOccurrence In oNibs
-            ' Check if the nib touches or interferes with this plate
             Dim oCheckSet1 As ObjectCollection = oTO.CreateObjectCollection()
             Dim oCheckSet2 As ObjectCollection = oTO.CreateObjectCollection()
             oCheckSet1.Add(oPlate)
@@ -37,11 +36,17 @@ Sub Main()
 
             Dim oResults As InterferenceResults = oAsmDoc.ComponentDefinition.AnalyzeInterference(oCheckSet1, oCheckSet2)
 
-            ' If they touch or overlap, copy the nib body into the plate
             If oResults.Count > 0 Then
-                Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNib.SurfaceBodies.Item(1))
-                oTBRep.Transform(oCopiedBody, oInvMatrix)
+                ' Grab the native solid body from the Nib's PartDefinition
+                Dim oNativeNibBody As SurfaceBody = oNib.Definition.SurfaceBodies.Item(1)
+                Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNativeNibBody)
 
+                ' Calculate exact relative transform: Plate^-1 * Nib
+                Dim oRelativeMatrix As Matrix = oPlateInvMatrix.Copy()
+                oRelativeMatrix.TransformBy(oNib.Transformation)
+                oTBRep.Transform(oCopiedBody, oRelativeMatrix)
+
+                ' Insert as a Solid Base Feature
                 Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
                 Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
                 Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
@@ -52,11 +57,15 @@ Sub Main()
                 oDef.IsAssociative = False
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
-                oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+                
+                ' Verify it created a solid before adding to Combine
+                If oNewFeat.SurfaceBodies.Item(1).IsSolid Then
+                    oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+                End If
             End If
         Next
 
-        ' 3. Combine-Join all matched nibs into the plate in one single feature
+        ' 3. Combine-Join all matched nibs into the plate
         If oToolBodies.Count > 0 Then
             oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
         End If
@@ -65,3 +74,4 @@ Sub Main()
     oAsmDoc.Update()
     MessageBox.Show("Done!", "iLogic")
 End Sub
+
