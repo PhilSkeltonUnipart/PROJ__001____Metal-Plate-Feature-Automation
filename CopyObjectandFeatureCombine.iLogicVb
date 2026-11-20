@@ -5,16 +5,16 @@ Sub Main()
 
     Dim oPlates As New List(Of ComponentOccurrence)
     Dim oNibs As New List(Of ComponentOccurrence)
-    Dim oNibsToSuppress As New HashSet(Of ComponentOccurrence)
+    Dim oNibsToDelete As New HashSet(Of ComponentOccurrence)
 
-    ' 1. Sort top-level occurrences into Plates and Nibs
+    ' 1. Sort top-level occurrences into Plates (4 or 5 leading digits) and Nibs
     For Each oOcc As ComponentOccurrence In oAsmDoc.ComponentDefinition.Occurrences
         If oOcc.Suppressed Then Continue For
         Dim fName As String = System.IO.Path.GetFileNameWithoutExtension(oOcc.Definition.Document.FullFileName)
 
         If fName = "3mm-STD-NIB" Then
             oNibs.Add(oOcc)
-        ElseIf System.Text.RegularExpressions.Regex.IsMatch(fName, "^\d{5}-[A-Za-z]{3}-[A-Za-z]{2}\d{2}-\d{2}$") Then
+        ElseIf System.Text.RegularExpressions.Regex.IsMatch(fName, "^\d{4,5}-[A-Za-z]{3}-[A-Za-z]{2}\d{2}-\d{2}$") Then
             oPlates.Add(oOcc)
         End If
     Next
@@ -68,7 +68,7 @@ Sub Main()
                 ' Case A: Came in as a true solid body -> queue for Combine
                 If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
                     oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
-                    oNibsToSuppress.Add(oNib)
+                    oNibsToDelete.Add(oNib)
 
                 ' Case B: Came in as a WorkSurface -> wrap in SculptSurface and Join to Plate
                 ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
@@ -80,7 +80,7 @@ Sub Main()
                     oSculptCol.Add(oSculptSurf)
 
                     oSculptFeats.Add(oSculptCol, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
-                    oNibsToSuppress.Add(oNib)
+                    oNibsToDelete.Add(oNib)
                 End If
             End If
         Next
@@ -96,13 +96,12 @@ Sub Main()
         End If
     Next
 
-    ' 5. Suppress all matched 3mm-STD-NIB occurrences in the assembly
-    For Each oNibToSuppress As ComponentOccurrence In oNibsToSuppress
-        If Not oNibToSuppress.Suppressed Then
-            oNibToSuppress.Suppress()
-        End If
+    ' 5. Delete all matched 3mm-STD-NIB occurrences from the assembly
+    Dim deletedCount As Integer = oNibsToDelete.Count
+    For Each oNibToDelete As ComponentOccurrence In oNibsToDelete
+        oNibToDelete.Delete()
     Next
 
     oAsmDoc.Update2(True)
-    MessageBox.Show("Done! Merged and suppressed " & oNibsToSuppress.Count & " nib(s).", "iLogic")
+    MessageBox.Show("Done! Merged and deleted " & deletedCount & " nib(s).", "iLogic")
 End Sub
