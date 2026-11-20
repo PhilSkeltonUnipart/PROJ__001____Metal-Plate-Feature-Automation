@@ -1,66 +1,67 @@
 Sub Main()
-    Dim oAsmDoc As AssemblyDocument = TryCast(ThisApplication.ActiveDocument, AssemblyDocument)
-    If oAsmDoc Is Nothing Then
-        MessageBox.Show("Please run this rule from an Assembly document.", "iLogic")
-        Exit Sub
-    End If
-
-    Dim oTG As TransientGeometry = ThisApplication.TransientGeometry
+    Dim oAsmDoc As AssemblyDocument = ThisApplication.ActiveDocument
     Dim oTO As TransientObjects = ThisApplication.TransientObjects
+    Dim oTBRep As TransientBRep = ThisApplication.TransientBRep
 
-    ' 1. Pick the Source Occurrence (body to copy) and Target Occurrence (part to receive & combine)
-    Dim oSourceOcc As ComponentOccurrence = ThisApplication.CommandManager.Pick(
-        SelectionFilterEnum.kAssemblyLeafOccurrenceFilter, "Select SOURCE part (body to copy)")
-    If oSourceOcc Is Nothing Then Exit Sub
+    Dim oPlates As New List(Of ComponentOccurrence)
+    Dim oNibs As New List(Of ComponentOccurrence)
 
-    Dim oTargetOcc As ComponentOccurrence = ThisApplication.CommandManager.Pick(
-        SelectionFilterEnum.kAssemblyLeafOccurrenceFilter, "Select TARGET part (to copy into and combine)")
-    If oTargetOcc Is Nothing Then Exit Sub
+    ' 1. Sort all occurrences into Plates and Nibs by file name
+    For Each oOcc As ComponentOccurrence In oAsmDoc.ComponentDefinition.Occurrences
+        If oOcc.Suppressed Then Continue For
+        Dim fName As String = System.IO.Path.GetFileNameWithoutExtension(oOcc.Definition.Document.FullFileName)
 
-    Dim oTargetDef As PartComponentDefinition = oTargetOcc.Definition
+        If fName = "3mm-STD-NIB" Then
+            oNibs.Add(oOcc)
+        ElseIf System.Text.RegularExpressions.Regex.IsMatch(fName, "^\d{5}-[A-Za-z]{3}-[A-Za-z]{2}\d{2}-\d{2}$") Then
+            oPlates.Add(oOcc)
+        End If
+    Next
 
-    ' Ensure the target part already has a base body to combine with
-    If oTargetDef.SurfaceBodies.Count = 0 Then
-        MessageBox.Show("Target part must contain at least one solid body.", "iLogic")
-        Exit Sub
-    End If
-    Dim oBaseBody As SurfaceBody = oTargetDef.SurfaceBodies.Item(1)
+    ' 2. Check each plate against each nib
+    For Each oPlate As ComponentOccurrence In oPlates
+        Dim oPlateDef As PartComponentDefinition = oPlate.Definition
+        Dim oBaseBody As SurfaceBody = oPlateDef.SurfaceBodies.Item(1)
+        Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
 
-    ' 2. Copy the source body (SurfaceBodyProxy automatically captures assembly transform)
-    Dim oSourceBodyProxy As SurfaceBodyProxy = oSourceOcc.SurfaceBodies.Item(1)
-    Dim oCopiedTransientBody As SurfaceBody = ThisApplication.TransientBRep.Copy(oSourceBodyProxy)
+        ' Get inverse matrix to convert assembly coordinates into this plate's local space
+        Dim oInvMatrix As Matrix = oPlate.Transformation
+        oInvMatrix.Invert()
 
-    ' Transform the transient body from Assembly space into the Target Part's local coordinate space
-    Dim oTargetTransform As Matrix = oTargetOcc.Transformation
-    oTargetTransform.Invert()
-    ThisApplication.TransientBRep.Transform(oCopiedTransientBody, oTargetTransform)
+        For Each oNib As ComponentOccurrence In oNibs
+            ' Check if the nib touches or interferes with this plate
+            Dim oCheckSet1 As ObjectCollection = oTO.CreateObjectCollection()
+            Dim oCheckSet2 As ObjectCollection = oTO.CreateObjectCollection()
+            oCheckSet1.Add(oPlate)
+            oCheckSet2.Add(oNib)
 
-    ' 3. Insert the copied body into the Target Part as a Non-Parametric Base Feature
-    Dim oBaseFeats As NonParametricBaseFeatures = oTargetDef.Features.NonParametricBaseFeatures
-    Dim oBaseFeatDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
+            Dim oResults As InterferenceResults = oAsmDoc.ComponentDefinition.AnalyzeInterference(oCheckSet1, oCheckSet2)
 
-    Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
-    oInputCol.Add(oCopiedTransientBody)
+            ' If they touch or overlap, copy the nib body into the plate
+            If oResults.Count > 0 Then
+                Dim oCopiedBody As SurfaceBody = oTBRep.Copy(oNib.SurfaceBodies.Item(1))
+                oTBRep.Transform(oCopiedBody, oInvMatrix)
 
-    oBaseFeatDef.BRepEntities = oInputCol
-    oBaseFeatDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
-    oBaseFeatDef.IsAssociative = False
+                Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
+                Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
+                Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
+                oInputCol.Add(oCopiedBody)
 
-    Dim oNewBaseFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oBaseFeatDef)
-    Dim oToolBody As SurfaceBody = oNewBaseFeat.SurfaceBodies.Item(1)
+                oDef.BRepEntities = oInputCol
+                oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
+                oDef.IsAssociative = False
 
-    ' 4. Combine the Base Body and the newly copied Tool Body
-    Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
-    oToolBodies.Add(oToolBody)
+                Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
+                oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+            End If
+        Next
 
-    ' Operation options: kJoinOperation, kCutOperation, kIntersectOperation
-    Dim oCombineFeat As CombineFeature = oTargetDef.Features.CombineFeatures.Add(
-        oBaseBody,
-        oToolBodies,
-        PartFeatureOperationEnum.kJoinOperation,
-        False ' KeepToolBodies = False
-    )
+        ' 3. Combine-Join all matched nibs into the plate in one single feature
+        If oToolBodies.Count > 0 Then
+            oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
+        End If
+    Next
 
     oAsmDoc.Update()
-    MessageBox.Show("Copy and Combine complete!", "iLogic")
+    MessageBox.Show("Done!", "iLogic")
 End Sub
