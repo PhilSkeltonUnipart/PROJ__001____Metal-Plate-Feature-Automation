@@ -21,8 +21,10 @@ Sub Main()
     ' 2. Check each plate against each nib
     For Each oPlate As ComponentOccurrence In oPlates
         Dim oPlateDef As PartComponentDefinition = oPlate.Definition
+        Dim oPlateDoc As PartDocument = oPlateDef.Document
         Dim oBaseBody As SurfaceBody = oPlateDef.SurfaceBodies.Item(1)
         Dim oToolBodies As ObjectCollection = oTO.CreateObjectCollection()
+        Dim plateModified As Boolean = False
 
         ' Get inverse matrix of the plate
         Dim oPlateInvMatrix As Matrix = oPlate.Transformation
@@ -60,6 +62,7 @@ Sub Main()
                 oDef.DeleteOriginal = True
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
+                plateModified = True
 
                 ' Case A: Came in as a true solid body -> queue for Combine
                 If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
@@ -69,7 +72,7 @@ Sub Main()
                 ElseIf oPlateDef.WorkSurfaces.Count > surfCountBefore Then
                     Dim oNewestWorkSurf As WorkSurface = oPlateDef.WorkSurfaces.Item(oPlateDef.WorkSurfaces.Count)
                     Dim oSculptFeats As SculptFeatures = oPlateDef.Features.SculptFeatures
-                    Dim oSculptSurf As SculptSurface = oSculptFeats.CreateSculptSurface(oNewestWorkSurf, PartFeatureExtentDirectionEnum.kPositiveExtentDirection)
+                    Dim oSculptSurf As SculptSurface = oSculptFeats.CreateSculptSurface(oNewestWorkSurf, PartFeatureExtentDirectionEnum.kNegativeExtentDirection)
 
                     Dim oSculptCol As ObjectCollection = oTO.CreateObjectCollection()
                     oSculptCol.Add(oSculptSurf)
@@ -83,8 +86,14 @@ Sub Main()
         If oToolBodies.Count > 0 Then
             oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
         End If
+
+        ' 4. Force the Sheet Metal / Part document to compute the new Sculpt features immediately
+        If plateModified Then
+            oPlateDoc.Update2(True)
+        End If
     Next
 
-    oAsmDoc.Update()
+    oAsmDoc.Update2(True)
     MessageBox.Show("Done!", "iLogic")
 End Sub
+
