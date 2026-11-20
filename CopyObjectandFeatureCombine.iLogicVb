@@ -45,7 +45,7 @@ Sub Main()
                 oTBRep.Transform(oCopiedBody, oNib.Transformation)
                 oTBRep.Transform(oCopiedBody, oPlateInvMatrix)
 
-                ' Insert as a Solid Base Feature using TargetOccurrence
+                ' Insert as a Non-Parametric Base Feature
                 Dim oBaseFeats As NonParametricBaseFeatures = oPlateDef.Features.NonParametricBaseFeatures
                 Dim oDef As NonParametricBaseFeatureDefinition = oBaseFeats.CreateDefinition()
                 Dim oInputCol As ObjectCollection = oTO.CreateObjectCollection()
@@ -55,14 +55,24 @@ Sub Main()
                 oDef.OutputType = BaseFeatureOutputTypeEnum.kSolidOutputType
                 oDef.IsAssociative = False
                 oDef.DeleteOriginal = True
-                oDef.TargetOccurrence = oPlate
 
                 Dim oNewFeat As NonParametricBaseFeature = oBaseFeats.AddByDefinition(oDef)
-                oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+
+                ' Check if Inventor created a solid body or a closed work surface
+                If oNewFeat.SurfaceBodies.Count > 0 AndAlso oNewFeat.SurfaceBodies.Item(1).IsSolid Then
+                    oToolBodies.Add(oNewFeat.SurfaceBodies.Item(1))
+                ElseIf oNewFeat.Faces.Count > 0 Then
+                    ' Convert the closed surface into a solid and join it directly to the plate via Sculpt
+                    Dim oSculptSurfaces As ObjectCollection = oTO.CreateObjectCollection()
+                    Dim oWorkSurf As WorkSurface = oNewFeat.Faces.Item(1).Parent
+                    oSculptSurfaces.Add(oWorkSurf)
+
+                    oPlateDef.Features.SculptFeatures.Add(oSculptSurfaces, PartFeatureOperationEnum.kJoinOperation, oBaseBody)
+                End If
             End If
         Next
 
-        ' 3. Combine-Join all matched nibs into the plate
+        ' 3. Combine any nibs that came in directly as solids
         If oToolBodies.Count > 0 Then
             oPlateDef.Features.CombineFeatures.Add(oBaseBody, oToolBodies, PartFeatureOperationEnum.kJoinOperation, False)
         End If
