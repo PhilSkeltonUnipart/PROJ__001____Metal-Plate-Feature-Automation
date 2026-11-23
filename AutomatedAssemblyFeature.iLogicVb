@@ -1,9 +1,12 @@
 ' ============================================================
 ' INVENTOR NIB AUTOMATION
 '
-' Assembly / Plate Scanner + Nib Edge Analysis + Corrected Nib Orientation Preview
+' Assembly / Plate Scanner + Nib Edge Analysis + Transient Solid B-rep Transfer and Combine
 '
-' Version: 0.4.8.2
+' Version: 0.5.2.4
+'   - Adds temporary, real assembly nib source occurrences before plate processing
+'   - Retains those occurrences if any target plate fails or is skipped
+'   - Removes staging occurrences only after their corresponding plate processing succeeds
 '
 ' Purpose:
 '   - Scan the active Inventor assembly
@@ -19,14 +22,19 @@
 '   - Calculate assembly-space candidate positions and display temporary client-graphics markers
 '   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
 '   - Apply a 90-degree roll correction about the nib local +Y projection axis
-'   - Optionally add temporary nib preview occurrences to the active assembly
+'   - Generate repeated copies of the nib solid in each eligible plate part
+'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates
+'   - Join each nib solid to the plate using CombineFeatures (Join operation)
+'   - Report solid-body and existing flat-pattern status for user review
 '   - Reject edges with insufficient usable length or nib separation
 '   - Produce a centralised diagnostic log
 '
-' IMPORTANT: This version does NOT modify plate solid geometry, sketches, features or constraints.
-' If preview is accepted, it adds separate temporary component occurrences of the nib part
-' to the active assembly. These are NOT combined with plates. Do not save the assembly
-' if you want to discard the preview occurrences. Temporary candidate markers remain client graphics.
+' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.
+' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,
+' inserted as non-associative solid base features, then joined with CombineFeatures.
+' It does NOT automatically save any documents. Review each modified plate and save manually.
+' If a plate operation fails, its Inventor transaction is aborted where possible.
+' This is the first geometry-generation build; verify the resulting sheet-metal flat pattern in Inventor.
 '
 ' ============================================================
 
@@ -62,6 +70,13 @@ Sub Main()
     Dim InternalMarkerCoordinates As New System.Collections.ArrayList
     Dim ExternalMarkerCoordinates As New System.Collections.ArrayList
     Dim NibPreviewPlacements As New System.Collections.ArrayList
+    Dim NibPartPlacements As New System.Collections.ArrayList
+    Dim NibStagingOccurrences As New System.Collections.ArrayList
+
+    ' A small intentional overlap helps the nib and plate share real volume
+    ' for a reliable Boolean Join. Confirm this against the nib base geometry.
+    Dim NibJoinOverlapMM As Double = 0.2
+    Dim NibThicknessMatchToleranceMM As Double = 0.25
     Dim NibReferenceFile As String = ""
     Dim RootAssemblyTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
 
@@ -256,7 +271,9 @@ Sub Main()
         Logger.Info("External minimum usable edge length: " & ExternalMinimumUsableLengthMM & " mm")
         Logger.Info("Internal minimum usable edge length: " & InternalMinimumUsableLengthMM & " mm")
         Logger.Info("Minimum nib centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
-        Logger.Warning("Preview mode: plate geometry will not be changed. Optional separate nib occurrences may be added to the assembly after analysis.")
+        Logger.Warning("Generation mode: after confirmation, nib solids will be copied into eligible plate documents and combined with their plate bodies.")
+        Logger.Info("Configured nib/plate join overlap: " & NibJoinOverlapMM & " mm")
+        Logger.Info("Nib/plate thickness match tolerance: " & NibThicknessMatchToleranceMM & " mm")
 
         ScanOccurrences( _
             AssemblyDoc.ComponentDefinition.Occurrences, _
@@ -273,7 +290,9 @@ Sub Main()
             InternalMarkerCoordinates, _
             ExternalMarkerCoordinates, _
             NibPreviewPlacements, _
+            NibPartPlacements, _
             RootAssemblyTransform, _
+            Nothing, _
             TotalOccurrences, _
             TotalParts, _
             SheetMetalParts, _
@@ -284,10 +303,25 @@ Sub Main()
 
         DrawNibCandidateMarkers(AssemblyDoc, InternalMarkerCoordinates, ExternalMarkerCoordinates)
 
-        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso NibPreviewPlacements.Count > 0 Then
-            CreateNibPreviewOccurrences(AssemblyDoc, NibReferenceFile, NibPreviewPlacements)
+        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso NibPartPlacements.Count > 0 Then
+            ' First create real assembly component occurrences at the proven v0.4.8.2
+            ' assembly-space placement frames. These are the temporary Copy Object
+            ' source components requested for the staged workflow.
+            If CreateNibStagingOccurrences(AssemblyDoc, NibReferenceFile, NibPreviewPlacements, NibStagingOccurrences, NibJoinOverlapMM) Then
+                ' Transfer/Combine remains transaction-controlled in each target IPT.
+                ' Staging occurrences are retained unless the corresponding plate
+                ' processing completes successfully; see cleanup routine below.
+                GenerateNibGeometryInPlateParts( _
+                    NibReferenceFile, _
+                    NibPartPlacements, _
+                    NibJoinOverlapMM, _
+                    NibThicknessMatchToleranceMM, _
+                    NibStagingOccurrences)
+            Else
+                Logger.Error("Assembly staging occurrences could not be created. Plate geometry generation was not started.")
+            End If
         Else
-            Logger.Warning("No nib preview occurrences created. Either no reference part was selected or no valid placement frames were calculated.")
+            Logger.Warning("No nib geometry generated. Either no reference part was selected or no valid local placement frames were calculated.")
         End If
 
 
@@ -392,7 +426,9 @@ Sub ScanOccurrences( _
     InternalMarkerCoordinates As System.Collections.ArrayList, _
     ExternalMarkerCoordinates As System.Collections.ArrayList, _
     NibPreviewPlacements As System.Collections.ArrayList, _
+    NibPartPlacements As System.Collections.ArrayList, _
     ParentAssemblyTransform As Inventor.Matrix, _
+    ParentOccurrenceProxy As Object, _
     ByRef TotalOccurrences As Integer, _
     ByRef TotalParts As Integer, _
     ByRef SheetMetalParts As Integer, _
@@ -411,6 +447,17 @@ Sub ScanOccurrences( _
 
         Dim CurrentOccurrenceTransform As Inventor.Matrix = ParentAssemblyTransform.Copy()
         CurrentOccurrenceTransform.PostMultiplyBy(Occurrence.Transformation)
+
+        ' Retain each target component in root assembly context for Copy Object.
+        Dim CurrentOccurrenceContext As Object = Occurrence
+        If ParentOccurrenceProxy IsNot Nothing Then
+            Try
+                ParentOccurrenceProxy.CreateGeometryProxy(Occurrence, CurrentOccurrenceContext)
+            Catch ProxyEx As Exception
+                CurrentOccurrenceContext = Nothing
+                Logger.Error("Could not create root-context occurrence proxy for " & Occurrence.Name & ": " & ProxyEx.Message)
+            End Try
+        End If
 
         TotalOccurrences += 1
 
@@ -490,6 +537,11 @@ Sub ScanOccurrences( _
             ' RECURSE INTO SUBASSEMBLY
             ' ------------------------------------------------
 
+            If CurrentOccurrenceContext Is Nothing Then
+                Logger.Error("Subassembly " & Occurrence.Name & " has no root-context occurrence proxy; its children are skipped to prevent incorrect Copy Object targets.")
+                Continue For
+            End If
+
             ScanOccurrences( _
                 SubAssemblyDoc.ComponentDefinition.Occurrences, _
                 PlateComponentType, _
@@ -505,7 +557,9 @@ Sub ScanOccurrences( _
                 InternalMarkerCoordinates, _
                 ExternalMarkerCoordinates, _
                 NibPreviewPlacements, _
+                NibPartPlacements, _
                 CurrentOccurrenceTransform, _
+                CurrentOccurrenceContext, _
                 TotalOccurrences, _
                 TotalParts, _
                 SheetMetalParts, _
@@ -723,7 +777,7 @@ Sub ScanOccurrences( _
 
 
         ' ====================================================
-        ' NIB EDGE ANALYSIS + PREVIEW PLACEMENT CALCULATION
+        ' NIB EDGE ANALYSIS + PLACEMENT FRAME CALCULATION
         ' ====================================================
 
         AnalyzePlateGeometry( _
@@ -732,6 +786,7 @@ Sub ScanOccurrences( _
             NibProfile,
             PhysicalThicknessMM,
             CurrentOccurrenceTransform,
+            CurrentOccurrenceContext,
             MinimumNibEdgeLengthMM,
             ExternalEndClearanceMM,
             InternalEndClearanceMM,
@@ -741,9 +796,10 @@ Sub ScanOccurrences( _
             MinimumNibCentreSeparationMM,
             InternalMarkerCoordinates,
             ExternalMarkerCoordinates,
-            NibPreviewPlacements)
+            NibPreviewPlacements,
+            NibPartPlacements)
 
-        ' Preview occurrences are separate components; plate solids are not changed.
+        ' Part-local placement frames are retained for the confirmed in-part geometry stage.
 
 
     Next
@@ -770,7 +826,7 @@ End Sub
 '   - Apply the selected nib profile after geometric classification.
 '   - Use independent clearances for internal openings and external perimeters.
 '   - Transform calculated nib centres into assembly coordinates and draw temporary markers.
-'   - Calculate candidate positions and nib placement frames; optional preview occurrences are separate assembly components.
+'   - Calculate candidate positions and both assembly-space and part-local nib placement frames.
 '
 ' This is intended to handle rotated plates and angled outlines because
 ' it does not depend on global X/Y/Z directions or rectangular shapes.
@@ -782,6 +838,7 @@ Sub AnalyzePlateGeometry( _
     NibProfile As String, _
     PhysicalThicknessMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
+    TargetOccurrenceContext As Object, _
     MinimumNibEdgeLengthMM As Double, _
     ExternalEndClearanceMM As Double, _
     InternalEndClearanceMM As Double, _
@@ -791,7 +848,8 @@ Sub AnalyzePlateGeometry( _
     MinimumNibCentreSeparationMM As Double, _
     InternalMarkerCoordinates As System.Collections.ArrayList, _
     ExternalMarkerCoordinates As System.Collections.ArrayList, _
-    NibPreviewPlacements As System.Collections.ArrayList)
+    NibPreviewPlacements As System.Collections.ArrayList, _
+    NibPartPlacements As System.Collections.ArrayList)
 
     Logger.Section("NIB EDGE ANALYSIS")
     Logger.Info("Occurrence: " & OccurrenceName)
@@ -1025,7 +1083,7 @@ Sub AnalyzePlateGeometry( _
                                     InternalMarkerCoordinates, ExternalMarkerCoordinates)
                                 AddNibPreviewPlacement(PartDoc, MainFace, BoundaryLoop, Edge, _
                                     PositionMM, EdgeLengthMM, PhysicalThicknessMM, OccurrenceTransform, _
-                                    NibPreviewPlacements)
+                                    TargetOccurrenceContext, NibPreviewPlacements, NibPartPlacements)
                             End If
                         Next
                         Logger.Info("  Boundary type: " & LoopType)
@@ -1050,8 +1108,9 @@ Sub AnalyzePlateGeometry( _
     Logger.Info("Candidate edges: " & CandidateEdges)
     Logger.Info("Rejected edges: " & RejectedEdges)
     Logger.Info("Calculated candidate positions: " & CandidatePositions)
-    Logger.Info("Calculated nib placement frames: " & NibPreviewPlacements.Count)
-    Logger.Warning("Plate solid geometry remains unchanged. If preview is accepted, separate nib component occurrences are added to the assembly for visual inspection.")
+    Logger.Info("Calculated assembly-space placement frames: " & NibPreviewPlacements.Count)
+    Logger.Info("Part-local nib placement frames collected: " & NibPartPlacements.Count)
+    Logger.Warning("No geometry is changed during analysis. Geometry generation occurs only after the final confirmation in the main routine.")
 
 End Sub
 
@@ -1090,7 +1149,9 @@ Sub AddNibPreviewPlacement( _
     EdgeLengthMM As Double, _
     PhysicalThicknessMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
-    Placements As System.Collections.ArrayList)
+    TargetOccurrenceContext As Object, _
+    Placements As System.Collections.ArrayList, _
+    PartPlacements As System.Collections.ArrayList)
 
     Try
         If PartDoc Is Nothing OrElse BroadFace Is Nothing OrElse BoundaryLoop Is Nothing OrElse Edge Is Nothing Then Exit Sub
@@ -1177,6 +1238,9 @@ Sub AddNibPreviewPlacement( _
             EdgePoint.Y - (XAxis.Y * HalfThicknessCM), _
             EdgePoint.Z - (XAxis.Z * HalfThicknessCM))
 
+        ' Store a second frame in the plate part's own coordinates. This is
+        ' essential because the geometry will be generated inside the IPT,
+        ' not as a separate assembly occurrence.
         ' Transform origin and axis endpoints into assembly coordinates.
         Dim O As Inventor.Point = OriginPart.Copy()
         O.TransformBy(OccurrenceTransform)
@@ -1197,6 +1261,19 @@ Sub AddNibPreviewPlacement( _
 
         ' Store origin followed by the X, Y and Z basis vectors (assembly coordinates).
         Placements.Add(New Double() {O.X, O.Y, O.Z, AX.X, AX.Y, AX.Z, AY.X, AY.Y, AY.Z, AZ.X, AZ.Y, AZ.Z})
+
+        ' Append the paired plate-local record only after the assembly-space
+        ' record has been successfully calculated. This keeps both arrays aligned.
+        Dim StagingOccurrenceIndex As Integer = Placements.Count - 1
+        PartPlacements.Add(New Object() { _
+            PartDoc.FullFileName, _
+            OriginPart.X, OriginPart.Y, OriginPart.Z, _
+            XAxis.X, XAxis.Y, XAxis.Z, _
+            YAxis.X, YAxis.Y, YAxis.Z, _
+            ZAxis.X, ZAxis.Y, ZAxis.Z, _
+            OccurrenceTransform.Copy(), _
+            StagingOccurrenceIndex, _
+            TargetOccurrenceContext})
     Catch ex As Exception
         Logger.Debug("Nib placement frame calculation failed: " & ex.Message)
     End Try
@@ -1215,68 +1292,569 @@ Function GetBoundaryLoopCentre(BoundaryLoop As Inventor.EdgeLoop) As Inventor.Po
     Return ThisApplication.TransientGeometry.CreatePoint(X / Count, Y / Count, Z / Count)
 End Function
 
-Sub CreateNibPreviewOccurrences( _
+
+' ============================================================
+' V0.5.2.4 - ASSEMBLY NIB STAGING OCCURRENCES
+'
+' Creates actual reference-part component occurrences using the exact
+' assembly-space frames calculated by the proven v0.4.8.2 placement routine.
+' The occurrence objects are retained until their corresponding plate transfer and joins succeed.
+' ============================================================
+
+Function CreateNibStagingOccurrences( _
     AssemblyDoc As Inventor.AssemblyDocument, _
     NibFilePath As String, _
-    Placements As System.Collections.ArrayList)
+    AssemblyPlacements As System.Collections.ArrayList, _
+    StagingOccurrences As System.Collections.ArrayList, _
+    JoinOverlapMM As Double) As Boolean
 
-    If AssemblyDoc Is Nothing OrElse Placements Is Nothing OrElse Placements.Count = 0 Then Exit Sub
-    Logger.Section("NIB ORIENTATION PREVIEW")
-    Logger.Info("Reference nib: " & NibFilePath)
-    Logger.Info("Nib local attachment plane: ZX")
-    Logger.Info("Nib local projection direction: +Y")
-    Logger.Info("Nib local +Y is aligned outwards from each selected plate boundary")
-    Logger.Info("Orientation correction: 90-degree roll about local +Y")
-    Logger.Info("Nib local +X is aligned with the selected broad-face normal")
-    Logger.Info("Nib local +Z is aligned along the selected plate edge")
-    Logger.Info("Calculated placement frames: " & Placements.Count)
-    Logger.Warning("Preview creates separate component occurrences in the active assembly. It does not copy or combine geometry into the plates.")
+    CreateNibStagingOccurrences = False
+    If AssemblyDoc Is Nothing OrElse String.IsNullOrWhiteSpace(NibFilePath) Then Return False
+    If AssemblyPlacements Is Nothing OrElse AssemblyPlacements.Count = 0 Then Return False
+
+    Logger.Section("V0.5.2.4 - ASSEMBLY NIB SOURCE OCCURRENCES")
+    Logger.Info("Assembly-space placement frames: " & AssemblyPlacements.Count)
+    Logger.Info("Reference component: " & NibFilePath)
 
     Dim Answer As System.Windows.Forms.DialogResult = System.Windows.Forms.MessageBox.Show( _
-        "Create " & Placements.Count & " temporary nib preview occurrence(s) using 3mm-STD-NIB.ipt?" & vbCrLf & vbCrLf & _
-        "These are separate assembly components, not combined plate geometry. The assembly will be modified in memory. " & _
-        "Close without saving to discard the preview.", _
-        "Inventor Nib Automation - v0.4.8.2 Preview", _
+        "Create " & AssemblyPlacements.Count & " temporary nib component occurrence(s) in the assembly?" & vbCrLf & vbCrLf & _
+        "These real component occurrences provide visible source geometry for the staged transfer workflow. " & _
+        "Each source occurrence is removed only after its corresponding plate completes all transfers and joins. Failed/skipped plate source occurrences are retained.", _
+        "Inventor Nib Automation - v0.5.2.3", _
         System.Windows.Forms.MessageBoxButtons.YesNo, _
-        System.Windows.Forms.MessageBoxIcon.Question)
+        System.Windows.Forms.MessageBoxIcon.Warning)
+
     If Answer <> System.Windows.Forms.DialogResult.Yes Then
-        Logger.Info("User declined nib preview occurrence creation.")
-        Exit Sub
+        Logger.Warning("User declined assembly source occurrence creation. No plate generation will be performed.")
+        Return False
     End If
 
     Dim Created As Integer = 0
     Dim Failed As Integer = 0
-    Dim PreviewLimit As Integer = 300
-    Dim CountToCreate As Integer = Math.Min(Placements.Count, PreviewLimit)
-    If Placements.Count > PreviewLimit Then
-        Logger.Warning("Preview limited to first " & PreviewLimit & " placements to avoid overwhelming the assembly graphics.")
+    Dim Limit As Integer = 300
+    Dim ToCreate As Integer = Math.Min(AssemblyPlacements.Count, Limit)
+    If AssemblyPlacements.Count > Limit Then
+        Logger.Warning("Assembly staging occurrence creation limited to " & Limit & " placements.")
     End If
 
-    For i As Integer = 0 To CountToCreate - 1
+    For i As Integer = 0 To ToCreate - 1
         Try
-            Dim Values() As Double = CType(Placements(i), Double())
-            Dim PlacementMatrix As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
-            Dim PlacementOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(Values(0), Values(1), Values(2))
-            Dim PlacementXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(3), Values(4), Values(5))
-            Dim PlacementYAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(6), Values(7), Values(8))
-            Dim PlacementZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(9), Values(10), Values(11))
-            PlacementMatrix.SetCoordinateSystem(PlacementOrigin, PlacementXAxis, PlacementYAxis, PlacementZAxis)
-            AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, PlacementMatrix)
+            Dim Values() As Double = CType(AssemblyPlacements(i), Double())
+            Dim M As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
+            Dim O As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(Values(0), Values(1), Values(2))
+            Dim X As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(3), Values(4), Values(5))
+            Dim Y As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(6), Values(7), Values(8))
+            Dim Z As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(9), Values(10), Values(11))
+            ' Apply the intentional join overlap to the source occurrence itself.
+            ' Copy Object TargetOccurrence will perform the assembly-to-part mapping.
+            Dim OverlapCM As Double = AssemblyDoc.UnitsOfMeasure.ConvertUnits(JoinOverlapMM, "mm", "cm")
+            Dim OverlappedOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+                O.X - (Y.X * OverlapCM), O.Y - (Y.Y * OverlapCM), O.Z - (Y.Z * OverlapCM))
+            M.SetCoordinateSystem(OverlappedOrigin, X, Y, Z)
+
+            Dim NibOccurrence As Inventor.ComponentOccurrence = _
+                AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, M)
+            If NibOccurrence Is Nothing Then Throw New Exception("Occurrences.Add returned Nothing.")
+            StagingOccurrences.Add(NibOccurrence)
             Created += 1
         Catch ex As Exception
             Failed += 1
-            Logger.Debug("Preview occurrence " & (i + 1) & " failed: " & ex.Message)
+            Logger.Error("Unable to create staging nib occurrence " & (i + 1) & ": " & ex.Message)
         End Try
     Next
+
+    Logger.Info("Temporary assembly nib occurrences created: " & Created)
+    Logger.Info("Temporary assembly nib occurrences failed: " & Failed)
+    Logger.Info("Staging occurrence indices are aligned with the assembly-space and plate-local placement arrays.")
+
+    If Created = 0 OrElse Failed > 0 Then
+        Logger.Error("Staging occurrence creation was incomplete. Plate geometry generation has been stopped. Any successfully created occurrences are retained for inspection.")
+        Return False
+    End If
+
+    ThisApplication.ActiveView.Update()
+    CreateNibStagingOccurrences = True
+End Function
+
+
+Sub RemoveStagingOccurrenceAt( _
+    StagingOccurrences As System.Collections.ArrayList, _
+    StagingIndex As Integer)
+
+    If StagingOccurrences Is Nothing Then Exit Sub
+    If StagingIndex < 0 OrElse StagingIndex >= StagingOccurrences.Count Then Exit Sub
+
+    Try
+        Dim Occ As Inventor.ComponentOccurrence = _
+            TryCast(StagingOccurrences(StagingIndex), Inventor.ComponentOccurrence)
+        If Occ IsNot Nothing Then
+            Occ.Delete()
+            StagingOccurrences(StagingIndex) = Nothing
+            Logger.Success("Removed temporary nib source occurrence after successful plate transfer: index " & StagingIndex)
+        End If
+    Catch ex As Exception
+        Logger.Warning("Could not remove temporary nib source occurrence at index " & StagingIndex & ": " & ex.Message)
+    End Try
+End Sub
+
+Sub RemoveSuccessfulNibStagingOccurrences(StagingOccurrences As System.Collections.ArrayList)
+    If StagingOccurrences Is Nothing OrElse StagingOccurrences.Count = 0 Then Exit Sub
+
+    Logger.Section("V0.5.2.4 - STAGING OCCURRENCE CLEANUP")
+    Dim Removed As Integer = 0
+    Dim Failed As Integer = 0
+
+    For i As Integer = StagingOccurrences.Count - 1 To 0 Step -1
+        Try
+            Dim Occ As Inventor.ComponentOccurrence = TryCast(StagingOccurrences(i), Inventor.ComponentOccurrence)
+            If Occ IsNot Nothing Then
+                Occ.Delete()
+                Removed += 1
+            End If
+        Catch ex As Exception
+            Failed += 1
+            Logger.Warning("Could not remove temporary nib occurrence " & (i + 1) & ": " & ex.Message)
+        End Try
+    Next
+
+    Logger.Info("Temporary nib source occurrences removed after successful plate processing: " & Removed)
+    If Failed > 0 Then Logger.Warning("Temporary nib source occurrences that could not be removed: " & Failed)
+End Sub
+
+' ============================================================
+' V0.5.2.4 - TRANSIENT SOLID B-REP IN-PLATE NIB TRANSFER
+'
+' Transfer sequence:
+'   1. Obtain the native solid body from the matching temporary nib occurrence.
+'   2. Copy it into transient B-rep space using TransientBRep.Copy.
+'   3. Transform that transient solid using the proven plate-local placement frame.
+'   4. Create a non-associative solid NonParametricBaseFeature with AddByDefinition.
+'   5. Verify the feature and resulting body are solid, then Combine Join.
+'
+' The 0.2 mm overlap is applied along the plate-local nib +Y direction.
+' Failed plates retain their source nib occurrences; successful plates remove
+' only their own staging occurrences after all joins succeed.
+' ============================================================
+
+Sub GenerateNibGeometryInPlateParts( _
+    NibFilePath As String, _
+    Placements As System.Collections.ArrayList, _
+    JoinOverlapMM As Double, _
+    ThicknessMatchToleranceMM As Double, _
+    StagingOccurrences As System.Collections.ArrayList)
+
+    If String.IsNullOrWhiteSpace(NibFilePath) OrElse Placements Is Nothing OrElse Placements.Count = 0 Then Exit Sub
+
+    Logger.Section("V0.5.2.4 - OCCURRENCE-BASED NIB TRANSFER AND COMBINE")
+    Logger.Info("Nib reference: " & NibFilePath)
+    Logger.Info("Part-local placement records: " & Placements.Count)
+    Logger.Info("Join overlap: " & JoinOverlapMM & " mm")
+    Logger.Warning("This operation modifies plate part documents in memory. No files are saved automatically.")
+
+    Dim Confirm As System.Windows.Forms.DialogResult = System.Windows.Forms.MessageBox.Show( _
+        "Generate and combine " & Placements.Count & " calculated nib placement(s)?" & vbCrLf & vbCrLf & _
+        "The rule will modify each eligible PL part document in memory:" & vbCrLf & _
+        "1. Create temporary nib component occurrences in the assembly as source/recovery geometry." & vbCrLf & _
+        "2. Copy each source occurrence body into its target plate using the Copy Object-style solid base-feature definition." & vbCrLf & _
+        "3. Verify solid output, then Join each nib to the plate with Combine (Join)." & vbCrLf & vbCrLf & _
+        "No documents are saved automatically. Test on a copy of your assembly first.", _
+        "Inventor Nib Automation - v0.5.2.3", _
+        System.Windows.Forms.MessageBoxButtons.YesNo, _
+        System.Windows.Forms.MessageBoxIcon.Warning)
+
+    If Confirm <> System.Windows.Forms.DialogResult.Yes Then
+        Logger.Info("User declined in-part nib geometry generation. No plate geometry was changed.")
+        Exit Sub
+    End If
+
+    Dim NibDoc As Inventor.PartDocument = Nothing
+    Try
+        NibDoc = CType(ThisApplication.Documents.Open(NibFilePath, False), Inventor.PartDocument)
+    Catch ex As Exception
+        Logger.Error("Unable to open nib reference part: " & ex.Message)
+        Exit Sub
+    End Try
+
+    Dim NibDef As Inventor.PartComponentDefinition = CType(NibDoc.ComponentDefinition, Inventor.PartComponentDefinition)
+    Dim NibBody As Inventor.SurfaceBody = Nothing
+    For Each SourceBody As Inventor.SurfaceBody In NibDef.SurfaceBodies
+        If SourceBody IsNot Nothing AndAlso SourceBody.IsSolid Then
+            If NibBody IsNot Nothing Then
+                Logger.Error("Nib reference contains more than one solid body. Select/prepare a single-solid nib part before generation.")
+                Exit Sub
+            End If
+            NibBody = SourceBody
+        End If
+    Next
+    If NibBody Is Nothing Then
+        Logger.Error("Nib reference part contains no solid body. Generation stopped.")
+        Exit Sub
+    End If
+
+    Dim NibRange As Inventor.Box = NibBody.RangeBox
+    Dim NibThicknessCM As Double = Math.Abs(NibRange.MaxPoint.X - NibRange.MinPoint.X)
+    Dim NibThicknessMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibThicknessCM, "cm", "mm")
+    Dim NibMinYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MinPoint.Y, "cm", "mm")
+    Dim NibMaxYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MaxPoint.Y, "cm", "mm")
+    Logger.Info("Nib solid local X thickness: " & Math.Round(NibThicknessMM, 3) & " mm")
+    Logger.Info("Nib solid local Y range: " & _
+                Math.Round(NibMinYMM, 3) & " to " & Math.Round(NibMaxYMM, 3) & " mm")
+    If Math.Abs(NibMinYMM) > 0.1 OrElse NibMaxYMM <= NibMinYMM Then
+        Logger.Error("Nib solid does not appear to start at its ZX attachment plane (expected local Y minimum approximately 0 and projection towards +Y). Generation stopped to prevent incorrect attachment positioning.")
+        Exit Sub
+    End If
+    Logger.Info("Nib local +Y attachment-plane check: PASS")
+    Logger.Info("Nib solid local Z range: " & _
+                Math.Round(NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MinPoint.Z, "cm", "mm"), 3) & _
+                " to " & Math.Round(NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MaxPoint.Z, "cm", "mm"), 3) & " mm")
+
+    ' Process each unique plate file once. Repeated assembly occurrences of
+    ' the same IPT produce identical local placement frames, which are deduplicated.
+    Dim ProcessedFiles As New System.Collections.ArrayList
+    Dim TotalNibCopies As Integer = 0
+    Dim TotalNibJoins As Integer = 0
+    Dim FailedPlateFiles As Integer = 0
+
+    For Each Record As Object In Placements
+        Dim Values() As Object = CType(Record, Object())
+        Dim PlatePath As String = CStr(Values(0))
+        If ProcessedFiles.Contains(PlatePath) Then Continue For
+        ProcessedFiles.Add(PlatePath)
+
+        Dim PlateRecords As New System.Collections.ArrayList
+        For Each Candidate As Object In Placements
+            Dim CandidateValues() As Object = CType(Candidate, Object())
+            If String.Equals(CStr(CandidateValues(0)), PlatePath, StringComparison.OrdinalIgnoreCase) Then
+                PlateRecords.Add(Candidate)
+            End If
+        Next
+
+        Logger.Section("GENERATING NIBS - " & System.IO.Path.GetFileName(PlatePath))
+        Logger.Info("Raw placement records for this part: " & PlateRecords.Count)
+
+        Dim PlateDoc As Inventor.PartDocument = Nothing
+        Try
+            PlateDoc = CType(ThisApplication.Documents.Open(PlatePath, False), Inventor.PartDocument)
+        Catch ex As Exception
+            Logger.Error("Unable to open target plate part: " & ex.Message)
+            FailedPlateFiles += 1
+            Continue For
+        End Try
+
+        Dim PlateDef As Inventor.PartComponentDefinition = CType(PlateDoc.ComponentDefinition, Inventor.PartComponentDefinition)
+
+        Dim AlreadyGenerated As Boolean = False
+        For Each ExistingJoin As Inventor.CombineFeature In PlateDef.Features.CombineFeatures
+            If ExistingJoin IsNot Nothing AndAlso ExistingJoin.Name.StartsWith("NIB_AUTO_JOIN_", StringComparison.OrdinalIgnoreCase) Then
+                AlreadyGenerated = True
+                Exit For
+            End If
+        Next
+        If AlreadyGenerated Then
+            Logger.Warning("This plate already contains v0.5.x NIB_AUTO_JOIN features. Skipped to prevent duplicate nib generation. Remove/undo the previous generated features deliberately before rerunning.")
+            Continue For
+        End If
+
+        Dim PlateThicknessParameterMM As Double = 0
+        Dim PlateThicknessMM As Double = GetPhysicalPlateThicknessMM(PlateDoc, PlateThicknessParameterMM)
+        If PlateThicknessMM <= 0 Then
+            Logger.Error("Physical plate thickness could not be re-measured. Part skipped.")
+            FailedPlateFiles += 1
+            Continue For
+        End If
+
+        Logger.Info("Measured plate thickness: " & Math.Round(PlateThicknessMM, 3) & " mm")
+        If Math.Abs(PlateThicknessMM - NibThicknessMM) > ThicknessMatchToleranceMM Then
+            Logger.Error("Nib thickness (" & Math.Round(NibThicknessMM, 3) & _
+                         " mm) does not match plate thickness (" & Math.Round(PlateThicknessMM, 3) & _
+                         " mm) within " & ThicknessMatchToleranceMM & " mm. Part skipped to avoid a mismatched laser-cut profile.")
+            FailedPlateFiles += 1
+            Continue For
+        End If
+
+        Dim SolidBodyCount As Integer = 0
+        Dim BaseBody As Inventor.SurfaceBody = Nothing
+        For Each ExistingBody As Inventor.SurfaceBody In PlateDef.SurfaceBodies
+            If ExistingBody IsNot Nothing AndAlso ExistingBody.IsSolid Then
+                SolidBodyCount += 1
+                If BaseBody Is Nothing Then BaseBody = ExistingBody
+            End If
+        Next
+        If SolidBodyCount <> 1 OrElse BaseBody Is Nothing Then
+            Logger.Error("Expected exactly one existing solid plate body; found " & SolidBodyCount & ". Part skipped to avoid joining to the wrong body.")
+            FailedPlateFiles += 1
+            Continue For
+        End If
+
+        ' Remove duplicate local frames caused by the same IPT being used
+        ' by multiple assembly occurrences.
+        Dim UniqueRecords As New System.Collections.ArrayList
+        Dim SeenKeys As New System.Collections.ArrayList
+        For Each Candidate As Object In PlateRecords
+            Dim V() As Object = CType(Candidate, Object())
+            Dim Key As String = BuildNibPlacementKey(V)
+            If Not SeenKeys.Contains(Key) Then
+                SeenKeys.Add(Key)
+                UniqueRecords.Add(Candidate)
+            End If
+        Next
+        Logger.Info("Unique nib positions for this plate: " & UniqueRecords.Count)
+
+        If UniqueRecords.Count = 0 Then Continue For
+
+        Dim PartTransaction As Inventor.Transaction = Nothing
+        Dim PartSucceeded As Boolean = False
+        Dim PartNibCopies As Integer = 0
+        Dim PartNibJoins As Integer = 0
+
+        Try
+            PartTransaction = ThisApplication.TransactionManager.StartTransaction(PlateDoc, _
+                "Inventor Nib Automation v0.5.2.3 - Generate and Combine Nibs")
+
+            For NibIndex As Integer = 0 To UniqueRecords.Count - 1
+                Dim V() As Object = CType(UniqueRecords(NibIndex), Object())
+                Dim Origin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+                    CDbl(V(1)), CDbl(V(2)), CDbl(V(3)))
+                Dim XAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(4)), CDbl(V(5)), CDbl(V(6)))
+                Dim YAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(7)), CDbl(V(8)), CDbl(V(9)))
+                Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(10)), CDbl(V(11)), CDbl(V(12)))
+
+                ' Retrieve the exact temporary nib occurrence created from the
+                ' matching assembly-space placement frame. Its component definition
+                ' supplies the native solid body; its occurrence transform locates
+                ' that body in assembly coordinates.
+                Dim StagingIndex As Integer = CInt(V(14))
+                If StagingIndex < 0 OrElse StagingIndex >= StagingOccurrences.Count Then
+                    Throw New Exception("No matching assembly nib source occurrence exists for placement " & (NibIndex + 1))
+                End If
+
+                Dim NibSourceOccurrence As Inventor.ComponentOccurrence = _
+                    TryCast(StagingOccurrences(StagingIndex), Inventor.ComponentOccurrence)
+                If NibSourceOccurrence Is Nothing Then
+                    Throw New Exception("Matching assembly nib source occurrence is invalid at placement " & (NibIndex + 1))
+                End If
+
+                Dim NibSourceDef As Inventor.PartComponentDefinition = _
+                    TryCast(NibSourceOccurrence.Definition, Inventor.PartComponentDefinition)
+                If NibSourceDef Is Nothing OrElse NibSourceDef.SurfaceBodies.Count < 1 Then
+                    Throw New Exception("Assembly nib occurrence has no accessible source part body at placement " & (NibIndex + 1))
+                End If
+
+                Dim NibSourceBody As Inventor.SurfaceBody = Nothing
+                For Each CandidateSourceBody As Inventor.SurfaceBody In NibSourceDef.SurfaceBodies
+                    If CandidateSourceBody IsNot Nothing AndAlso CandidateSourceBody.IsSolid Then
+                        If NibSourceBody IsNot Nothing Then
+                            Throw New Exception("Assembly nib source contains more than one solid body at placement " & (NibIndex + 1))
+                        End If
+                        NibSourceBody = CandidateSourceBody
+                    End If
+                Next
+                If NibSourceBody Is Nothing Then
+                    Throw New Exception("Assembly nib source occurrence contains no solid body at placement " & (NibIndex + 1))
+                End If
+
+                ' Create a true transient solid copy of the nib source body and
+                ' transform it directly into the target IPT's native coordinates.
+                '
+                ' The previous assembly-proxy route returned a surface feature in
+                ' Inventor for every nested target plate, despite kSolidOutputType.
+                ' This route avoids mixing a root-level staging occurrence proxy
+                ' with a nested ComponentOccurrenceProxy as TargetOccurrence.
+                ' AddByDefinition accepts transient solid B-rep entities directly.
+                Dim CopiedNibBody As Inventor.SurfaceBody = _
+                    ThisApplication.TransientBRep.Copy(NibSourceBody)
+                If CopiedNibBody Is Nothing OrElse Not CopiedNibBody.IsSolid Then
+                    Throw New Exception("Transient copy of source nib did not produce a solid at position " & (NibIndex + 1))
+                End If
+
+                ' V(1..12) is the proven nib placement frame in plate-part
+                ' coordinates: origin, local X, local Y, local Z.
+                Dim PartOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+                    CDbl(V(1)), CDbl(V(2)), CDbl(V(3)))
+                Dim PartXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(4)), CDbl(V(5)), CDbl(V(6)))
+                Dim PartYAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(7)), CDbl(V(8)), CDbl(V(9)))
+                Dim PartZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+                    CDbl(V(10)), CDbl(V(11)), CDbl(V(12)))
+
+                ' Preserve the configured 0.2 mm nib/plate overlap. The staging
+                ' occurrence is shifted inward along local +Y before transfer.
+                Dim OverlapCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits( _
+                    JoinOverlapMM, "mm", "cm")
+                PartOrigin.X -= PartYAxis.X * OverlapCM
+                PartOrigin.Y -= PartYAxis.Y * OverlapCM
+                PartOrigin.Z -= PartYAxis.Z * OverlapCM
+
+                Dim PartPlacementMatrix As Inventor.Matrix = _
+                    ThisApplication.TransientGeometry.CreateMatrix()
+                PartPlacementMatrix.SetCoordinateSystem( _
+                    PartOrigin, PartXAxis, PartYAxis, PartZAxis)
+                ThisApplication.TransientBRep.Transform(CopiedNibBody, PartPlacementMatrix)
+
+                If Not CopiedNibBody.IsSolid Then
+                    Throw New Exception("Transformed transient nib is no longer a solid at position " & (NibIndex + 1))
+                End If
+
+                Logger.Info("Nib " & (NibIndex + 1) & " source occurrence: " & NibSourceOccurrence.Name)
+                Logger.Info("Nib " & (NibIndex + 1) & " transient source copy: IsSolid=True")
+                Logger.Info("Nib " & (NibIndex + 1) & " placement transformed into target plate coordinates.")
+
+                Dim CopyDefinition As Inventor.NonParametricBaseFeatureDefinition = _
+                    PlateDef.Features.NonParametricBaseFeatures.CreateDefinition()
+                Dim CopyEntities As Inventor.ObjectCollection = _
+                    ThisApplication.TransientObjects.CreateObjectCollection()
+                CopyEntities.Add(CopiedNibBody)
+                CopyDefinition.BRepEntities = CopyEntities
+                CopyDefinition.OutputType = Inventor.BaseFeatureOutputTypeEnum.kSolidOutputType
+                CopyDefinition.IsAssociative = False
+
+                Logger.Info("Nib " & (NibIndex + 1) & " base feature definition: OutputType=kSolidOutputType; transient solid B-rep; target part coordinates")
+
+                Dim CopiedFeature As Inventor.NonParametricBaseFeature = _
+                    PlateDef.Features.NonParametricBaseFeatures.AddByDefinition(CopyDefinition)
+                If CopiedFeature Is Nothing Then
+                    Throw New Exception("Transient-solid AddByDefinition returned Nothing at nib position " & (NibIndex + 1))
+                End If
+                CopiedFeature.Name = "NIB_AUTO_BODY_" & (NibIndex + 1).ToString("0000")
+
+                Logger.Info("Nib " & (NibIndex + 1) & " base feature created; feature IsSolid=" & CopiedFeature.IsSolid.ToString())
+                If Not CopiedFeature.IsSolid Then
+                    Throw New Exception("Transient-solid base feature was created as a surface, not a solid, at position " & (NibIndex + 1))
+                End If
+                If CopiedFeature.SurfaceBodies.Count < 1 Then
+                    Throw New Exception("Transient-solid base feature returned no SurfaceBody at position " & (NibIndex + 1))
+                End If
+
+                Dim ToolBody As Inventor.SurfaceBody = Nothing
+                For Each ResultBody As Inventor.SurfaceBody In CopiedFeature.SurfaceBodies
+                    If ResultBody IsNot Nothing AndAlso ResultBody.IsSolid Then
+                        ToolBody = ResultBody
+                        Exit For
+                    End If
+                Next
+                If ToolBody Is Nothing Then
+                    Throw New Exception("Base feature reports solid output but contains no solid SurfaceBody at position " & (NibIndex + 1))
+                End If
+
+                Logger.Info("Nib " & (NibIndex + 1) & " copied solid volume (cm^3): " & _
+                            Math.Round(ToolBody.Volume(0.01), 6).ToString())
+                PartNibCopies += 1
+
+                Dim ToolBodies As Inventor.ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection()
+                ToolBodies.Add(ToolBody)
+
+                ' Combine Join consumes the tool body on success. Reacquire
+                ' the resulting base body from the Combine feature for the next nib.
+                Logger.Info("Attempting Combine Join for nib " & (NibIndex + 1))
+                Dim JoinedFeature As Inventor.CombineFeature = PlateDef.Features.CombineFeatures.Add( _
+                    BaseBody, ToolBodies, Inventor.PartFeatureOperationEnum.kJoinOperation, False)
+                If JoinedFeature Is Nothing OrElse JoinedFeature.SurfaceBodies.Count < 1 Then
+                    Throw New Exception("Combine Join returned no result at nib position " & (NibIndex + 1))
+                End If
+                JoinedFeature.Name = "NIB_AUTO_JOIN_" & (NibIndex + 1).ToString("0000")
+                BaseBody = Nothing
+                For Each JoinedBody As Inventor.SurfaceBody In JoinedFeature.SurfaceBodies
+                    If JoinedBody IsNot Nothing AndAlso JoinedBody.IsSolid Then
+                        BaseBody = JoinedBody
+                        Exit For
+                    End If
+                Next
+                If BaseBody Is Nothing Then
+                    Throw New Exception("Combine Join did not return a solid result at nib position " & (NibIndex + 1))
+                End If
+                PartNibJoins += 1
+            Next
+
+            PlateDoc.Update2(True)
+            PartTransaction.End()
+            PartTransaction = Nothing
+            PartSucceeded = True
+
+        Catch ex As Exception
+            Logger.Error("Plate generation failed: " & ex.Message)
+            If PartTransaction IsNot Nothing Then
+                Try
+                    PartTransaction.Abort()
+                    Logger.Warning("Inventor transaction aborted for this plate; partial nib changes should be rolled back.")
+                Catch AbortEx As Exception
+                    Logger.Error("Transaction abort also failed: " & AbortEx.Message)
+                End Try
+            End If
+        End Try
+
+        If PartSucceeded Then
+            TotalNibCopies += PartNibCopies
+            TotalNibJoins += PartNibJoins
+            Logger.Success("Nib bodies copied into plate: " & PartNibCopies)
+            Logger.Success("Nib bodies joined to plate: " & PartNibJoins)
+            Logger.Info("Final solid body count: " & PlateDef.SurfaceBodies.Count)
+            Try
+                Dim SheetDef As Inventor.SheetMetalComponentDefinition = TryCast(PlateDoc.ComponentDefinition, Inventor.SheetMetalComponentDefinition)
+                If SheetDef IsNot Nothing Then
+                    If SheetDef.HasFlatPattern Then
+                        Logger.Warning("A flat pattern exists. Update/recompute and inspect it before DXF export; this rule has not exported a DXF.")
+                    Else
+                        Logger.Warning("No existing flat pattern is present. Test Create Flat Pattern in Inventor before relying on this part for DXF export.")
+                    End If
+                Else
+                    Logger.Warning("The modified document is not exposed as a SheetMetalComponentDefinition; flat-pattern compatibility requires manual review.")
+                End If
+            Catch FlatEx As Exception
+                Logger.Warning("Flat-pattern status could not be queried: " & FlatEx.Message)
+            End Try
+            Logger.Warning("Plate document is modified in memory but has NOT been saved. Inspect the geometry and flat pattern, then save manually if correct.")
+
+            ' This plate has completed every transfer and Combine Join.
+            ' Delete only the temporary nib occurrences that supplied this
+            ' plate's placement records. Failed/skipped plate sources remain.
+            Dim RemovedIndices As New System.Collections.ArrayList
+            For Each CompletedRecord As Object In PlateRecords
+                Dim CompletedValues() As Object = CType(CompletedRecord, Object())
+                Dim CompletedIndex As Integer = CInt(CompletedValues(14))
+                If Not RemovedIndices.Contains(CompletedIndex) Then
+                    RemovedIndices.Add(CompletedIndex)
+                    RemoveStagingOccurrenceAt(StagingOccurrences, CompletedIndex)
+                End If
+            Next
+        Else
+            FailedPlateFiles += 1
+        End If
+    Next
+
+    Logger.Section("V0.5.2.4 GENERATION SUMMARY")
+    Logger.Info("Unique plate part files processed: " & ProcessedFiles.Count)
+    Logger.Info("Nib solids copied: " & TotalNibCopies)
+    Logger.Info("Successful Combine Join operations: " & TotalNibJoins)
+    Logger.Info("Plate files skipped or rolled back: " & FailedPlateFiles)
+    Logger.Warning("No DXF files were exported. Flat-pattern validation and DXF export remain a subsequent controlled stage.")
+    Logger.Warning("Review all modified plate documents before saving. Close without saving to discard unapproved changes.")
+
+    ' Count actual remaining references; do not imply cleanup succeeded when no plate succeeded.
+    Dim RemainingStaging As Integer = 0
+    For Each RemainingOccurrence As Object In StagingOccurrences
+        If RemainingOccurrence IsNot Nothing Then RemainingStaging += 1
+    Next
+    Dim RemovedStaging As Integer = StagingOccurrences.Count - RemainingStaging
+    Logger.Info("Temporary nib source occurrences actually removed after successful plate processing: " & RemovedStaging)
+    Logger.Info("Temporary nib source occurrences retained for failed/skipped plates or cleanup diagnosis: " & RemainingStaging)
 
     Try
         ThisApplication.ActiveView.Update()
     Catch
     End Try
-    Logger.Success("Nib preview occurrences created: " & Created)
-    If Failed > 0 Then Logger.Warning("Nib preview occurrence failures: " & Failed)
-    Logger.Warning("Review the preview visually. Do not save the assembly if you want to discard all temporary preview occurrences.")
 End Sub
+
+Function BuildNibPlacementKey(V() As Object) As String
+    Dim Parts As New System.Collections.ArrayList
+    For I As Integer = 1 To 12
+        Parts.Add(Math.Round(CDbl(V(I)), 5).ToString("0.00000", System.Globalization.CultureInfo.InvariantCulture))
+    Next
+    Return String.Join("|", CType(Parts.ToArray(GetType(String)), String()))
+End Function
 
 ' ============================================================
 ' TEMPORARY CANDIDATE MARKER GRAPHICS
