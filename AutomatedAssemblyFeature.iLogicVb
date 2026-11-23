@@ -3,48 +3,48 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis + Transient Solid B-rep Transfer and Combine
 '
-' Version: 0.6.0
+' Version: 0.6.1
 '   - Extends edge detection and nib placement from straight segments to planar curved edges
-'     (circular arcs, full circles, elliptical arcs, ellipses, and B-splines) via CurveEvaluator[cite: 1]
+'     (circular arcs, full circles, elliptical arcs, ellipses, and B-splines) via CurveEvaluator
 '   - Evaluates true arc lengths, equal arc-length intervals, and instantaneous curve tangents
-'     so nibs rotate smoothly along curved boundaries to remain normal to the cut edge[cite: 1]
+'     so nibs rotate smoothly along curved boundaries to remain normal to the cut edge
 '   - Handles closed loops (e.g., full circles and closed splines) with zero end clearance and
 '     non-overlapping full-perimeter distribution
 '   - Determines outward projection vectors via local surface-probing rather than loop centroids,
-'     ensuring accurate outward orientation on both convex and concave curves[cite: 1]
+'     ensuring accurate outward orientation on both convex and concave curves
 '   - Uses SurfaceEvaluator topological outward face normals to guarantee nibs remain centred on
-'     the plate mid-plane regardless of underlying plane normal orientation[cite: 1]
-'   - Adds temporary, real assembly nib source occurrences before plate processing[cite: 1]
-'   - Retains those occurrences if any target plate fails or is skipped[cite: 1]
-'   - Removes staging occurrences only after their corresponding plate processing succeeds[cite: 1]
+'     the plate mid-plane regardless of underlying plane normal orientation
+'   - Adds temporary, real assembly nib source occurrences before plate processing
+'   - Retains those occurrences if any target plate fails or is skipped
+'   - Removes staging occurrences only after their corresponding plate processing succeeds
 '
 ' Purpose:
-'   - Scan the active Inventor assembly[cite: 1]
-'   - Recursively scan subassemblies[cite: 1]
-'   - Validate assembly naming[cite: 1]
-'   - Validate part naming[cite: 1]
-'   - Identify PL components[cite: 1]
-'   - Identify sheet metal parts[cite: 1]
-'   - Measure physical plate thickness from geometry[cite: 1]
-'   - Warn only if sheet-metal parameter thickness differs[cite: 1]
-'   - Analyse internal openings and/or external boundaries (straight and curved) using a selected profile[cite: 1]
-'   - Use independent internal-opening and external-perimeter clearances / usable lengths[cite: 1]
-'   - Calculate assembly-space candidate positions and display temporary client-graphics markers[cite: 1]
-'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part[cite: 1]
-'   - Apply a 90-degree roll correction about the nib local +Y projection axis[cite: 1]
-'   - Generate repeated copies of the nib solid in each eligible plate part[cite: 1]
-'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates[cite: 1]
-'   - Join each nib solid to the plate using CombineFeatures (Join operation)[cite: 1]
-'   - Report solid-body and existing flat-pattern status for user review[cite: 1]
-'   - Reject edges with insufficient usable length or nib separation[cite: 1]
-'   - Produce a centralised diagnostic log[cite: 1]
+'   - Scan the active Inventor assembly
+'   - Recursively scan subassemblies
+'   - Validate assembly naming
+'   - Validate part naming
+'   - Identify PL components
+'   - Identify sheet metal parts
+'   - Measure physical plate thickness from geometry
+'   - Warn only if sheet-metal parameter thickness differs
+'   - Analyse internal openings and/or external boundaries (straight and curved) using a selected profile
+'   - Use independent internal-opening and external-perimeter clearances / usable lengths
+'   - Calculate assembly-space candidate positions and display temporary client-graphics markers
+'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
+'   - Apply a 90-degree roll correction about the nib local +Y projection axis
+'   - Generate repeated copies of the nib solid in each eligible plate part
+'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates
+'   - Join each nib solid to the plate using CombineFeatures (Join operation)
+'   - Report solid-body and existing flat-pattern status for user review
+'   - Reject edges with insufficient usable length or nib separation
+'   - Produce a centralised diagnostic log
 '
-' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.[cite: 1]
-' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,[cite: 1]
-' inserted as non-associative solid base features, then joined with CombineFeatures.[cite: 1]
-' It does NOT automatically save any documents. Review each modified plate and save manually.[cite: 1]
-' If a plate operation fails, its Inventor transaction is aborted where possible.[cite: 1]
-' Verify the resulting sheet-metal flat pattern in Inventor before DXF export.[cite: 1]
+' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.
+' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,
+' inserted as non-associative solid base features, then joined with CombineFeatures.
+' It does NOT automatically save any documents. Review each modified plate and save manually.
+' If a plate operation fails, its Inventor transaction is aborted where possible.
+' Verify the resulting sheet-metal flat pattern in Inventor before DXF export.
 '
 ' ============================================================
 
@@ -1172,16 +1172,27 @@ Sub AddNibPreviewPlacement( _
         Dim Tangent As Inventor.Vector = Nothing
         If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, EdgePoint, Tangent) Then Exit Sub
 
-        Dim FacePlane As Inventor.Plane = CType(BroadFace.Geometry, Inventor.Plane)
-        Dim FaceNormal As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-            FacePlane.Normal.X, FacePlane.Normal.Y, FacePlane.Normal.Z)
-        FaceNormal.Normalize()
+        ' Get the TRUE outward topological normal of the solid broad face (always points away from metal)
+        Dim FaceEval As Inventor.SurfaceEvaluator = BroadFace.Evaluator
+        Dim PtArr() As Double = {EdgePoint.X, EdgePoint.Y, EdgePoint.Z}
+        Dim GuessParams() As Double = {}
+        Dim MaxDev() As Double = {}
+        Dim Params() As Double = {}
+        Dim SolNatures() As Inventor.SolutionNatureEnum = {}
+        FaceEval.GetParamAtPoint(PtArr, GuessParams, MaxDev, Params, SolNatures)
 
-        ' Compute the two candidate in-plane vectors perpendicular to the curve tangent
+        Dim Normals() As Double = {}
+        FaceEval.GetNormal(Params, Normals)
+        Dim OutwardFaceNormal As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            Normals(0), Normals(1), Normals(2))
+        If OutwardFaceNormal.Length < 0.000001 Then Exit Sub
+        OutwardFaceNormal.Normalize()
+
+        ' Compute the in-plane vector perpendicular to the curve tangent
         Dim CandidateOutward As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-            (Tangent.Y * FaceNormal.Z) - (Tangent.Z * FaceNormal.Y), _
-            (Tangent.Z * FaceNormal.X) - (Tangent.X * FaceNormal.Z), _
-            (Tangent.X * FaceNormal.Y) - (Tangent.Y * FaceNormal.X))
+            (Tangent.Y * OutwardFaceNormal.Z) - (Tangent.Z * OutwardFaceNormal.Y), _
+            (Tangent.Z * OutwardFaceNormal.X) - (Tangent.X * OutwardFaceNormal.Z), _
+            (Tangent.X * OutwardFaceNormal.Y) - (Tangent.Y * OutwardFaceNormal.X))
         If CandidateOutward.Length < 0.000001 Then Exit Sub
         CandidateOutward.Normalize()
 
@@ -1201,26 +1212,21 @@ Sub AddNibPreviewPlacement( _
             CandidateOutward.ScaleBy(-1.0)
         End If
 
+        ' Build right-handed nib frame directly after the 90-degree roll about +Y:
+        '   +Y = Outward from the cut edge (projection direction of the nib)
+        '   +X = True outward face normal of the plate
+        '   +Z = X cross Y (runs along the edge tangent)
         Dim YAxis As Inventor.Vector = CandidateOutward
-        Dim ZAxis As Inventor.Vector = FaceNormal.Copy()
-
-        ' Initial right-handed frame before 90-degree roll about +Y
-        Dim InitialXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-            (YAxis.Y * ZAxis.Z) - (YAxis.Z * ZAxis.Y), _
-            (YAxis.Z * ZAxis.X) - (YAxis.X * ZAxis.Z), _
-            (YAxis.X * ZAxis.Y) - (YAxis.Y * ZAxis.X))
-        If InitialXAxis.Length < 0.000001 Then Exit Sub
-        InitialXAxis.Normalize()
-
-        ' 90-degree roll about local +Y: X(new)=Z(old), Z(new)=-X(old)
-        Dim XAxis As Inventor.Vector = ZAxis.Copy()
-        Dim CorrectedZAxis As Inventor.Vector = InitialXAxis.Copy()
-        CorrectedZAxis.ScaleBy(-1.0)
-        ZAxis = CorrectedZAxis
-        XAxis.Normalize()
+        Dim XAxis As Inventor.Vector = OutwardFaceNormal
+        Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            (XAxis.Y * YAxis.Z) - (XAxis.Z * YAxis.Y), _
+            (XAxis.Z * YAxis.X) - (XAxis.X * YAxis.Z), _
+            (XAxis.X * YAxis.Y) - (XAxis.Y * YAxis.X))
+        If ZAxis.Length < 0.000001 Then Exit Sub
         ZAxis.Normalize()
 
-        ' Centre nib across the plate's physical thickness along the broad-face normal
+        ' Since XAxis is guaranteed to point outward from the solid face, moving by
+        ' -HalfThicknessCM along XAxis always moves into the plate mid-plane.
         Dim HalfThicknessCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits( _
             PhysicalThicknessMM / 2.0, "mm", "cm")
         Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
