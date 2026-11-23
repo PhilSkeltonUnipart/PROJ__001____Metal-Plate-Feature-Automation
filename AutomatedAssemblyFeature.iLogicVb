@@ -1,1222 +1,371 @@
+Option Explicit On
 ' ============================================================
-' INVENTOR NIB AUTOMATION
+' INVENTOR NIB AUTOMATION (v0.7.0 - Streamlined & Configurable)
 '
-' Assembly / Plate Scanner + Nib Edge Analysis + Transient Solid B-rep Transfer and Combine
-'
-' Version: 0.6.1
-'   - Extends edge detection and nib placement from straight segments to planar curved edges
-'     (circular arcs, full circles, elliptical arcs, ellipses, and B-splines) via CurveEvaluator
-'   - Evaluates true arc lengths, equal arc-length intervals, and instantaneous curve tangents
-'     so nibs rotate smoothly along curved boundaries to remain normal to the cut edge
-'   - Handles closed loops (e.g., full circles and closed splines) with zero end clearance and
-'     non-overlapping full-perimeter distribution
-'   - Determines outward projection vectors via local surface-probing rather than loop centroids,
-'     ensuring accurate outward orientation on both convex and concave curves
-'   - Uses SurfaceEvaluator topological outward face normals to guarantee nibs remain centred on
-'     the plate mid-plane regardless of underlying plane normal orientation
-'   - Adds temporary, real assembly nib source occurrences before plate processing
-'   - Retains those occurrences if any target plate fails or is skipped
-'   - Removes staging occurrences only after their corresponding plate processing succeeds
-'
-' Purpose:
-'   - Scan the active Inventor assembly
-'   - Recursively scan subassemblies
-'   - Validate assembly naming
-'   - Validate part naming
-'   - Identify PL components
-'   - Identify sheet metal parts
-'   - Measure physical plate thickness from geometry
-'   - Warn only if sheet-metal parameter thickness differs
-'   - Analyse internal openings and/or external boundaries (straight and curved) using a selected profile
-'   - Use independent internal-opening and external-perimeter clearances / usable lengths
-'   - Calculate assembly-space candidate positions and display temporary client-graphics markers
-'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
-'   - Apply a 90-degree roll correction about the nib local +Y projection axis
-'   - Generate repeated copies of the nib solid in each eligible plate part
-'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates
-'   - Join each nib solid to the plate using CombineFeatures (Join operation)
-'   - Report solid-body and existing flat-pattern status for user review
-'   - Reject edges with insufficient usable length or nib separation
-'   - Produce a centralised diagnostic log
-'
-' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.
-' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,
-' inserted as non-associative solid base features, then joined with CombineFeatures.
-' It does NOT automatically save any documents. Review each modified plate and save manually.
-' If a plate operation fails, its Inventor transaction is aborted where possible.
-' Verify the resulting sheet-metal flat pattern in Inventor before DXF export.
-'
+' Scans an Inventor assembly for sheet-metal PL plates, analyses
+' straight and curved boundary edges via CurveEvaluator, stages
+' temporary nib occurrences, and joins solid nib bodies into
+' eligible plate parts via TransientBRep + CombineFeatures.
 ' ============================================================
 
 
 ' ============================================================
-' MAIN
+' USER CONFIGURATION & TOGGLES (EDIT RULES HERE)
 ' ============================================================
+Class NibConfig
+    ' --- Diagnostic Toggles (Code-Only, No Pop-Ups) ---
+    Public Shared EnableDiagnosticLog As Boolean = False   ' True = writes .log file next to assembly
+    Public Shared ShowCandidateMarkers As Boolean = False  ' True = draws 3D crosses in assembly view
 
+    ' --- Component & Reference Rules ---
+    Public Shared PlateComponentType As String = "PL"
+    Public Shared DefaultNibFileName As String = "3mm-STD-NIB.ipt"
+    Public Shared MaxStagingOccurrences As Integer = 300
+
+    ' --- Nibbing Edge & Spacing Rules (mm) ---
+    Public Shared MinimumNibEdgeLengthMM As Double = 150.0
+    Public Shared ExternalEndClearanceMM As Double = 75.0
+    Public Shared InternalEndClearanceMM As Double = 50.0
+    Public Shared MaximumNibSpacingMM As Double = 300.0
+    Public Shared ExternalMinimumUsableLengthMM As Double = 150.0
+    Public Shared InternalMinimumUsableLengthMM As Double = 150.0
+    Public Shared MinimumNibCentreSeparationMM As Double = 150.0
+    Public Shared LongEdgeThresholdRatio As Double = 0.75  ' Used by "Internal openings - long edges only"
+
+    ' --- Geometry & Join Tolerances ---
+    Public Shared NibJoinOverlapMM As Double = 0.2
+    Public Shared NibThicknessMatchToleranceMM As Double = 0.25
+    Public Shared ThicknessWarningToleranceMM As Double = 0.1
+    Public Shared OrientationToleranceDegrees As Double = 1.0
+End Class
+
+
+' ============================================================
+' MAIN ENTRY POINT
+' ============================================================
 Sub Main()
-
-    ' --------------------------------------------------------
-    ' SETTINGS
-    ' --------------------------------------------------------
-
-    Dim PlateComponentType As String = "PL"
-
-    ' Difference allowed between physical and sheet-metal
-    ' parameter thickness before a warning is generated.
-    Dim ThicknessWarningToleranceMM As Double = 0.1
-
-    ' Nib analysis settings. These are initial test values and
-    ' should be confirmed against the engineering standard.
-    Dim MinimumNibEdgeLengthMM As Double = 150.0
-    Dim ExternalEndClearanceMM As Double = 75.0
-    Dim InternalEndClearanceMM As Double = 50.0
-    Dim MaximumNibSpacingMM As Double = 300.0
-    Dim ExternalMinimumUsableLengthMM As Double = 150.0
-    Dim InternalMinimumUsableLengthMM As Double = 150.0
-    Dim MinimumNibCentreSeparationMM As Double = 150.0
-
-    ' Marker graphics are collected in assembly coordinates and drawn once
-    ' after scanning. They are temporary ClientGraphics, not model features.
-    Dim InternalMarkerCoordinates As New System.Collections.ArrayList
-    Dim ExternalMarkerCoordinates As New System.Collections.ArrayList
-    Dim NibPreviewPlacements As New System.Collections.ArrayList
-    Dim NibPartPlacements As New System.Collections.ArrayList
-    Dim NibStagingOccurrences As New System.Collections.ArrayList
-
-    ' A small intentional overlap helps the nib and plate share real volume
-    ' for a reliable Boolean Join. Confirm this against the nib base geometry.
-    Dim NibJoinOverlapMM As Double = 0.2
-    Dim NibThicknessMatchToleranceMM As Double = 0.25
-    Dim NibReferenceFile As String = ""
-    Dim RootAssemblyTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
-
-    ' Ask for one profile per run. No individual edge selection
-    ' is required; geometry detection is automatic.
-    Dim NibProfiles As String() = { _
-        "Internal openings - all suitable edges", _
-        "Internal openings - long edges only", _
-        "Internal openings + external perimeter", _
-        "External perimeter only"}
-
-    ' --------------------------------------------------------
-    ' START LOGGER
-    ' --------------------------------------------------------
-
     Logger.Start()
-
     Logger.Section("STARTING ASSEMBLY SCAN")
 
+    Dim AssemblyDoc As Inventor.AssemblyDocument = Nothing
 
     Try
-
-        ' ----------------------------------------------------
-        ' INVENTOR INFORMATION
-        ' ----------------------------------------------------
-
-        Logger.Info( _
-            "Inventor version: " & _
-            ThisApplication.SoftwareVersion.ToString())
-
-
-        ' ----------------------------------------------------
-        ' GET ACTIVE DOCUMENT
-        ' ----------------------------------------------------
-
-        Dim ActiveDoc As Inventor.Document = _
-            ThisApplication.ActiveDocument
-
-
-        If ActiveDoc Is Nothing Then
-
-            Logger.Error( _
-                "No active document found.")
-
-            ShowLog()
-
+        Dim ActiveDoc As Inventor.Document = ThisApplication.ActiveDocument
+        If ActiveDoc Is Nothing OrElse ActiveDoc.DocumentType <> Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
+            Logger.Error("Active document is missing or is not an assembly.")
+            SaveLogIfEnabled(Nothing)
             Exit Sub
-
         End If
 
+        AssemblyDoc = CType(ActiveDoc, Inventor.AssemblyDocument)
+        Logger.Info("Assembly: " & AssemblyDoc.DisplayName)
 
-        Logger.Info( _
-            "Active document: " & _
-            ActiveDoc.DisplayName)
+        ' 1. ONLY POP-UP: Select Nibbing Profile
+        Dim NibProfiles As String() = { _
+            "Internal openings - all suitable edges", _
+            "Internal openings - long edges only", _
+            "Internal openings + external perimeter", _
+            "External perimeter only"}
 
-
-        ' ----------------------------------------------------
-        ' CHECK DOCUMENT TYPE
-        ' ----------------------------------------------------
-
-        If ActiveDoc.DocumentType <> _
-            Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
-
-            Logger.Error( _
-                "Active document is not an assembly.")
-
-            Logger.Info( _
-                "Please open an assembly before running the scanner.")
-
-            ShowLog()
-
-            Exit Sub
-
-        End If
-
-
-        ' ----------------------------------------------------
-        ' CONVERT TO ASSEMBLY DOCUMENT
-        ' ----------------------------------------------------
-
-        Dim AssemblyDoc As Inventor.AssemblyDocument = _
-            CType( _
-                ActiveDoc, _
-                Inventor.AssemblyDocument)
-
-        NibReferenceFile = ResolveNibReferenceFile(AssemblyDoc)
-        If String.IsNullOrWhiteSpace(NibReferenceFile) Then
-            Logger.Warning("Nib reference part was not selected. Edge analysis will run without nib preview placement data.")
-        Else
-            Logger.Info("Nib reference part: " & NibReferenceFile)
-        End If
-
-
-        ' Ask for one profile per run, after confirming that an
-        ' assembly is active. No individual edge selection is needed.
         Dim NibProfile As String = InputListBox( _
-            "Choose the nibbing profile for this analysis run.", _
-            NibProfiles, _
-            NibProfiles(0), _
-            "Inventor Nib Automation - Profile", _
-            "Nibbing profiles")
+            "Choose the nibbing profile for this run.", _
+            NibProfiles, NibProfiles(0), _
+            "Inventor Nib Automation - Profile", "Nibbing profiles")
+        If String.IsNullOrWhiteSpace(NibProfile) Then Exit Sub
 
-        If String.IsNullOrWhiteSpace(NibProfile) Then
-            NibProfile = NibProfiles(0)
+        ' 2. Locate Reference Nib Part (silent if in assembly folder)
+        Dim NibReferenceFile As String = ResolveNibReferenceFile(AssemblyDoc)
+        If String.IsNullOrWhiteSpace(NibReferenceFile) Then
+            Logger.Warning("Nib reference part not found/selected. Geometry generation skipped.")
         End If
 
-
-        ' ----------------------------------------------------
-        ' ASSEMBLY INFORMATION
-        ' ----------------------------------------------------
-
-        Logger.Section("ASSEMBLY INFORMATION")
-
-
-        Dim AssemblyName As String = _
-            System.IO.Path.GetFileNameWithoutExtension( _
-                AssemblyDoc.FullFileName)
-
-
-        Logger.Info( _
-            "Assembly filename: " & _
-            AssemblyName)
-
-
-        Dim AssemblyData As AssemblyNameData = _
-            ParseAssemblyName(AssemblyName)
-
-
-        If AssemblyData.IsValid Then
-
-            Logger.Success( _
-                "Assembly naming convention: PASS")
-
-            Logger.Info( _
-                "Project: " & _
-                AssemblyData.ProjectNumber)
-
-            Logger.Info( _
-                "Description: " & _
-                AssemblyData.Description)
-
-            Logger.Info( _
-                "Assembly type: " & _
-                AssemblyData.AssemblyType)
-
-            Logger.Info( _
-                "Assembly number: " & _
-                AssemblyData.AssemblyNumber)
-
-            Logger.Info( _
-                "Revision: " & _
-                AssemblyData.Revision)
-
-        Else
-
-            Logger.Warning( _
-                "Assembly naming convention: FAIL")
-
-        End If
-
-
-        ' ----------------------------------------------------
-        ' COUNTERS
-        ' ----------------------------------------------------
-
-        Dim TotalOccurrences As Integer = 0
-
-        Dim TotalParts As Integer = 0
-
-        Dim SheetMetalParts As Integer = 0
-
-        Dim PLComponents As Integer = 0
-
-        Dim EligiblePlates As Integer = 0
-
-        Dim InvalidNames As Integer = 0
-
-        Dim SubAssemblies As Integer = 0
-
-
-        ' ----------------------------------------------------
-        ' SCAN ASSEMBLY
-        ' ----------------------------------------------------
-
-        Logger.Section("SCANNING COMPONENTS")
-
-        Logger.Info("Nibbing profile: " & NibProfile)
-        Logger.Info("Minimum candidate edge length: " & MinimumNibEdgeLengthMM & " mm")
-        Logger.Info("External perimeter end clearance: " & ExternalEndClearanceMM & " mm")
-        Logger.Info("Internal opening end clearance: " & InternalEndClearanceMM & " mm")
-        Logger.Info("Maximum nib centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
-        Logger.Info("External minimum usable edge length: " & ExternalMinimumUsableLengthMM & " mm")
-        Logger.Info("Internal minimum usable edge length: " & InternalMinimumUsableLengthMM & " mm")
-        Logger.Info("Minimum nib centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
-        Logger.Warning("Generation mode: after confirmation, nib solids will be copied into eligible plate documents and combined with their plate bodies.")
-        Logger.Info("Configured nib/plate join overlap: " & NibJoinOverlapMM & " mm")
-        Logger.Info("Nib/plate thickness match tolerance: " & NibThicknessMatchToleranceMM & " mm")
+        ' 3. Scan Assembly & Analyse Plate Boundaries
+        Dim Stats As New ScanStats()
+        Dim InternalMarkers As New System.Collections.Generic.List(Of Double)
+        Dim ExternalMarkers As New System.Collections.Generic.List(Of Double)
+        Dim Placements As New System.Collections.Generic.List(Of NibPlacement)
+        Dim RootTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
 
         ScanOccurrences( _
-            AssemblyDoc.ComponentDefinition.Occurrences, _
-            PlateComponentType, _
-            ThicknessWarningToleranceMM, _
-            NibProfile, _
-            MinimumNibEdgeLengthMM, _
-            ExternalEndClearanceMM, _
-            InternalEndClearanceMM, _
-            MaximumNibSpacingMM, _
-            ExternalMinimumUsableLengthMM, _
-            InternalMinimumUsableLengthMM, _
-            MinimumNibCentreSeparationMM, _
-            InternalMarkerCoordinates, _
-            ExternalMarkerCoordinates, _
-            NibPreviewPlacements, _
-            NibPartPlacements, _
-            RootAssemblyTransform, _
-            Nothing, _
-            TotalOccurrences, _
-            TotalParts, _
-            SheetMetalParts, _
-            PLComponents, _
-            EligiblePlates, _
-            InvalidNames, _
-            SubAssemblies)
+            AssemblyDoc.ComponentDefinition.Occurrences, NibProfile, RootTransform, _
+            InternalMarkers, ExternalMarkers, Placements, Stats)
 
-        DrawNibCandidateMarkers(AssemblyDoc, InternalMarkerCoordinates, ExternalMarkerCoordinates)
+        ' 4. Draw or Clear Temporary 3D Candidate Markers
+        UpdateCandidateMarkers(AssemblyDoc, InternalMarkers, ExternalMarkers)
 
-        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso NibPartPlacements.Count > 0 Then
-            ' First create real assembly component occurrences at the proven v0.4.8.2
-            ' assembly-space placement frames. These are the temporary Copy Object
-            ' source components requested for the staged workflow.
-            If CreateNibStagingOccurrences(AssemblyDoc, NibReferenceFile, NibPreviewPlacements, NibStagingOccurrences, NibJoinOverlapMM) Then
-                ' Transfer/Combine remains transaction-controlled in each target IPT.
-                ' Staging occurrences are retained unless the corresponding plate
-                ' processing completes successfully; see cleanup routine below.
-                GenerateNibGeometryInPlateParts( _
-                    NibReferenceFile, _
-                    NibPartPlacements, _
-                    NibJoinOverlapMM, _
-                    NibThicknessMatchToleranceMM, _
-                    NibStagingOccurrences)
-            Else
-                Logger.Error("Assembly staging occurrences could not be created. Plate geometry generation was not started.")
+        ' 5. Stage Nib Occurrences & Join Solids into Plates (No Confirmation Pop-Ups)
+        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso Placements.Count > 0 Then
+            Dim StagingOccurrences As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)
+            If CreateNibStagingOccurrences(AssemblyDoc, NibReferenceFile, Placements, StagingOccurrences) Then
+                GenerateNibGeometryInPlateParts(NibReferenceFile, Placements, StagingOccurrences)
             End If
         Else
-            Logger.Warning("No nib geometry generated. Either no reference part was selected or no valid local placement frames were calculated.")
+            Logger.Warning("No nib geometry generated (no valid placements or missing nib reference).")
         End If
 
-
-        ' ----------------------------------------------------
-        ' SUMMARY
-        ' ----------------------------------------------------
-
         Logger.Section("SCAN SUMMARY")
-
-
-        Logger.Info( _
-            "Assemblies found: " & _
-            SubAssemblies)
-
-
-        Logger.Info( _
-            "Total occurrences: " & _
-            TotalOccurrences)
-
-
-        Logger.Info( _
-            "Total parts: " & _
-            TotalParts)
-
-
-        Logger.Info( _
-            "Sheet metal parts: " & _
-            SheetMetalParts)
-
-
-        Logger.Info( _
-            "PL components: " & _
-            PLComponents)
-
-
-        Logger.Info( _
-            "Eligible plates: " & _
-            EligiblePlates)
-
-
-        Logger.Info( _
-            "Invalid filenames: " & _
-            InvalidNames)
-
-
-        ' ----------------------------------------------------
-        ' COMPLETE
-        ' ----------------------------------------------------
-
-        Logger.Section("SCAN COMPLETE")
-
-
-        Logger.Success( _
-            "Assembly scan completed.")
-
+        Logger.Info("Subassemblies: " & Stats.SubAssemblies & " | Total Parts: " & Stats.TotalParts & _
+                    " | PL Sheet Metal: " & Stats.EligiblePlates & " | Invalid Names: " & Stats.InvalidNames)
+        Logger.Success("Run completed.")
 
     Catch ex As Exception
-
-        ' ----------------------------------------------------
-        ' UNEXPECTED ERROR
-        ' ----------------------------------------------------
-
-        Logger.Error( _
-            "UNEXPECTED ERROR")
-
-        Logger.Error( _
-            ex.Message)
-
-        Logger.Debug( _
-            ex.StackTrace)
-
+        Logger.Error("UNEXPECTED ERROR: " & ex.Message)
+        Logger.Debug(ex.StackTrace)
     End Try
 
-
-    ' --------------------------------------------------------
-    ' SHOW LOG
-    ' --------------------------------------------------------
-
-    ShowLog()
-
-
+    SaveLogIfEnabled(AssemblyDoc)
 End Sub
 
+
+' ============================================================
+' DATA MODELS
+' ============================================================
+Class ScanStats
+    Public TotalOccurrences As Integer = 0
+    Public TotalParts As Integer = 0
+    Public SheetMetalParts As Integer = 0
+    Public PLComponents As Integer = 0
+    Public EligiblePlates As Integer = 0
+    Public InvalidNames As Integer = 0
+    Public SubAssemblies As Integer = 0
+End Class
+
+Class NibPlacement
+    Public PlatePath As String
+    ' Plate-local frame
+    Public PartOrigin As Inventor.Point
+    Public PartX As Inventor.Vector
+    Public PartY As Inventor.Vector
+    Public PartZ As Inventor.Vector
+    ' Assembly-space frame
+    Public AsmOrigin As Inventor.Point
+    Public AsmX As Inventor.Vector
+    Public AsmY As Inventor.Vector
+    Public AsmZ As Inventor.Vector
+    Public StagingIndex As Integer
+End Class
 
 
 ' ============================================================
 ' RECURSIVE ASSEMBLY SCANNER
 ' ============================================================
-
 Sub ScanOccurrences( _
     Occurrences As Inventor.ComponentOccurrences, _
-    PlateComponentType As String, _
-    ThicknessWarningToleranceMM As Double, _
     NibProfile As String, _
-    MinimumNibEdgeLengthMM As Double, _
-    ExternalEndClearanceMM As Double, _
-    InternalEndClearanceMM As Double, _
-    MaximumNibSpacingMM As Double, _
-    ExternalMinimumUsableLengthMM As Double, _
-    InternalMinimumUsableLengthMM As Double, _
-    MinimumNibCentreSeparationMM As Double, _
-    InternalMarkerCoordinates As System.Collections.ArrayList, _
-    ExternalMarkerCoordinates As System.Collections.ArrayList, _
-    NibPreviewPlacements As System.Collections.ArrayList, _
-    NibPartPlacements As System.Collections.ArrayList, _
-    ParentAssemblyTransform As Inventor.Matrix, _
-    ParentOccurrenceProxy As Object, _
-    ByRef TotalOccurrences As Integer, _
-    ByRef TotalParts As Integer, _
-    ByRef SheetMetalParts As Integer, _
-    ByRef PLComponents As Integer, _
-    ByRef EligiblePlates As Integer, _
-    ByRef InvalidNames As Integer, _
-    ByRef SubAssemblies As Integer)
+    ParentTransform As Inventor.Matrix, _
+    InternalMarkers As System.Collections.Generic.List(Of Double), _
+    ExternalMarkers As System.Collections.Generic.List(Of Double), _
+    Placements As System.Collections.Generic.List(Of NibPlacement), _
+    Stats As ScanStats)
 
+    For Each Occ As Inventor.ComponentOccurrence In Occurrences
+        Stats.TotalOccurrences += 1
+        If Occ.Suppressed Then Continue For
 
-    ' --------------------------------------------------------
-    ' LOOP THROUGH OCCURRENCES
-    ' --------------------------------------------------------
+        Dim CurrentTransform As Inventor.Matrix = ParentTransform.Copy()
+        CurrentTransform.PostMultiplyBy(Occ.Transformation)
 
-    For Each Occurrence As Inventor.ComponentOccurrence _
-        In Occurrences
-
-        Dim CurrentOccurrenceTransform As Inventor.Matrix = ParentAssemblyTransform.Copy()
-        CurrentOccurrenceTransform.PostMultiplyBy(Occurrence.Transformation)
-
-        ' Retain each target component in root assembly context for Copy Object.
-        Dim CurrentOccurrenceContext As Object = Occurrence
-        If ParentOccurrenceProxy IsNot Nothing Then
-            Try
-                ParentOccurrenceProxy.CreateGeometryProxy(Occurrence, CurrentOccurrenceContext)
-            Catch ProxyEx As Exception
-                CurrentOccurrenceContext = Nothing
-                Logger.Error("Could not create root-context occurrence proxy for " & Occurrence.Name & ": " & ProxyEx.Message)
-            End Try
-        End If
-
-        TotalOccurrences += 1
-
-
-        Logger.Debug( _
-            "Inspecting occurrence: " & _
-            Occurrence.Name)
-
-
-        ' ====================================================
-        ' SUPPRESSED COMPONENT
-        ' ====================================================
-
-        If Occurrence.Suppressed Then
-
-            Logger.Warning( _
-                Occurrence.Name & _
-                " is suppressed - skipped.")
-
+        ' Subassembly recursion
+        If Occ.DefinitionDocumentType = Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
+            Stats.SubAssemblies += 1
+            Dim SubDoc As Inventor.AssemblyDocument = CType(Occ.Definition.Document, Inventor.AssemblyDocument)
+            ScanOccurrences(SubDoc.ComponentDefinition.Occurrences, NibProfile, CurrentTransform, _
+                            InternalMarkers, ExternalMarkers, Placements, Stats)
             Continue For
-
         End If
 
+        ' Part validation
+        Stats.TotalParts += 1
+        Dim PartDoc As Inventor.PartDocument = CType(Occ.Definition.Document, Inventor.PartDocument)
+        Dim PartName As String = System.IO.Path.GetFileNameWithoutExtension(PartDoc.FullFileName)
 
-        ' ====================================================
-        ' CHECK FOR SUBASSEMBLY
-        ' ====================================================
-
-        If Occurrence.DefinitionDocumentType = _
-            Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
-
-
-            SubAssemblies += 1
-
-
-            Dim SubAssemblyDoc As Inventor.AssemblyDocument = _
-                CType( _
-                    Occurrence.Definition.Document, _
-                    Inventor.AssemblyDocument)
-
-
-            Dim SubAssemblyName As String = _
-                System.IO.Path.GetFileNameWithoutExtension( _
-                    SubAssemblyDoc.FullFileName)
-
-
-            Logger.Section("SUBASSEMBLY")
-
-
-            Logger.Info( _
-                "Name: " & _
-                SubAssemblyName)
-
-
-            ' ------------------------------------------------
-            ' PARSE SUBASSEMBLY NAME
-            ' ------------------------------------------------
-
-            Dim SubAssemblyData As AssemblyNameData = _
-                ParseAssemblyName(SubAssemblyName)
-
-
-            If SubAssemblyData.IsValid Then
-
-                Logger.Success( _
-                    "Naming convention: PASS")
-
-            Else
-
-                Logger.Warning( _
-                    "Subassembly naming convention: FAIL")
-
-            End If
-
-
-            ' ------------------------------------------------
-            ' RECURSE INTO SUBASSEMBLY
-            ' ------------------------------------------------
-
-            If CurrentOccurrenceContext Is Nothing Then
-                Logger.Error("Subassembly " & Occurrence.Name & " has no root-context occurrence proxy; its children are skipped to prevent incorrect Copy Object targets.")
-                Continue For
-            End If
-
-            ScanOccurrences( _
-                SubAssemblyDoc.ComponentDefinition.Occurrences, _
-                PlateComponentType, _
-                ThicknessWarningToleranceMM, _
-                NibProfile, _
-                MinimumNibEdgeLengthMM, _
-                ExternalEndClearanceMM, _
-                InternalEndClearanceMM, _
-                MaximumNibSpacingMM, _
-                ExternalMinimumUsableLengthMM, _
-                InternalMinimumUsableLengthMM, _
-                MinimumNibCentreSeparationMM, _
-                InternalMarkerCoordinates, _
-                ExternalMarkerCoordinates, _
-                NibPreviewPlacements, _
-                NibPartPlacements, _
-                CurrentOccurrenceTransform, _
-                CurrentOccurrenceContext, _
-                TotalOccurrences, _
-                TotalParts, _
-                SheetMetalParts, _
-                PLComponents, _
-                EligiblePlates, _
-                InvalidNames, _
-                SubAssemblies)
-
-
+        Dim CompType As String = ""
+        If Not TryParsePartType(PartName, CompType) Then
+            Stats.InvalidNames += 1
+            Logger.Warning("Invalid part filename format: " & PartName)
             Continue For
-
-
         End If
 
+        If CompType <> NibConfig.PlateComponentType Then Continue For
+        Stats.PLComponents += 1
 
-        ' ====================================================
-        ' PART
-        ' ====================================================
-
-        TotalParts += 1
-
-
-        Dim PartDoc As Inventor.PartDocument = _
-            CType( _
-                Occurrence.Definition.Document, _
-                Inventor.PartDocument)
-
-
-        Dim PartName As String = _
-            System.IO.Path.GetFileNameWithoutExtension( _
-                PartDoc.FullFileName)
-
-
-        Logger.Section("PART")
-
-
-        Logger.Info( _
-            "Occurrence: " & _
-            Occurrence.Name)
-
-
-        Logger.Info( _
-            "Filename: " & _
-            PartName)
-
-
-        ' ====================================================
-        ' PARSE PART NAME
-        ' ====================================================
-
-        Dim PartData As PartNameData = _
-            ParsePartName(PartName)
-
-
-        If Not PartData.IsValid Then
-
-            InvalidNames += 1
-
-
-            Logger.Warning( _
-                "Part naming convention: FAIL")
-
-            Logger.Warning( _
-                "Unable to determine component type.")
-
+        If Not (TypeOf PartDoc.ComponentDefinition Is Inventor.SheetMetalComponentDefinition) Then
+            Logger.Warning("PL part is not sheet metal: " & PartName)
             Continue For
-
         End If
+        Stats.SheetMetalParts += 1
 
-
-        Logger.Success( _
-            "Part naming convention: PASS")
-
-
-        ' ====================================================
-        ' CHECK COMPONENT TYPE
-        ' ====================================================
-
-        If PartData.ComponentType <> _
-            PlateComponentType Then
-
-
-            Logger.Info( _
-                "Component type is not " & _
-                PlateComponentType & _
-                " - ignored.")
-
+        Dim ParamThicknessMM As Double = 0
+        Dim PhysicalThicknessMM As Double = GetPhysicalPlateThicknessMM(PartDoc, ParamThicknessMM)
+        If PhysicalThicknessMM <= 0 Then
+            Logger.Warning("Could not measure physical thickness: " & PartName)
             Continue For
-
         End If
 
-
-        PLComponents += 1
-
-
-        Logger.Info( _
-            "Component identified as PL plate.")
-
-
-        ' ====================================================
-        ' CHECK SHEET METAL
-        ' ====================================================
-
-        Dim IsSheetMetal As Boolean = _
-            IsSheetMetalPart(PartDoc)
-
-
-        If IsSheetMetal Then
-
-            SheetMetalParts += 1
-
-
-            Logger.Success( _
-                "Sheet metal check: PASS")
-
-        Else
-
-            Logger.Warning( _
-                "Sheet metal check: FAIL")
-
-            Logger.Warning( _
-                "PL component is not recognised as sheet metal.")
-
-            Continue For
-
+        If ParamThicknessMM > 0 AndAlso Math.Abs(PhysicalThicknessMM - ParamThicknessMM) > NibConfig.ThicknessWarningToleranceMM Then
+            Logger.Warning(PartName & ": Parameter thickness (" & Math.Round(ParamThicknessMM, 3) & _
+                           " mm) differs from physical (" & Math.Round(PhysicalThicknessMM, 3) & " mm).")
         End If
 
-
-        ' ====================================================
-        ' PHYSICAL THICKNESS
-        '
-        ' The thickness displayed here comes from the physical
-        ' geometry, NOT the sheet-metal parameter.
-        '
-        ' The sheet-metal parameter is only checked internally
-        ' so that a warning can be generated if it disagrees.
-        ' ====================================================
-
-        Dim PhysicalThicknessMM As Double = 0
-
-        Dim ParameterThicknessMM As Double = 0
-
-
-        PhysicalThicknessMM = _
-            GetPhysicalPlateThicknessMM( _
-                PartDoc, _
-                ParameterThicknessMM)
-
-
-        If PhysicalThicknessMM > 0 Then
-
-
-            ' ------------------------------------------------
-            ' PHYSICAL THICKNESS
-            ' ------------------------------------------------
-
-            Logger.Info( _
-                "Physical thickness: " & _
-                Math.Round( _
-                    PhysicalThicknessMM, _
-                    3) & _
-                " mm")
-
-
-            ' ------------------------------------------------
-            ' PARAMETER DISCREPANCY WARNING
-            ' ------------------------------------------------
-
-            If ParameterThicknessMM > 0 Then
-
-                Dim ThicknessDifferenceMM As Double = _
-                    Math.Abs( _
-                        PhysicalThicknessMM - _
-                        ParameterThicknessMM)
-
-
-                If ThicknessDifferenceMM > _
-                    ThicknessWarningToleranceMM Then
-
-                    Logger.Warning( _
-                        "Sheet-metal parameter thickness is " & _
-                        Math.Round( _
-                            ParameterThicknessMM, _
-                            3) & _
-                        " mm; physical thickness is " & _
-                        Math.Round( _
-                            PhysicalThicknessMM, _
-                            3) & _
-                        " mm.")
-
-                End If
-
-            End If
-
-
-        Else
-
-            Logger.Warning( _
-                "Physical plate thickness could not be determined.")
-
-            Continue For
-
-        End If
-
-
-        ' ====================================================
-        ' CURRENT PLATE ELIGIBILITY
-        ' ====================================================
-
-        EligiblePlates += 1
-
-
-        Logger.Success( _
-            "PLATE ELIGIBILITY: PASS")
-
-
-        ' ====================================================
-        ' NIB EDGE ANALYSIS + PLACEMENT FRAME CALCULATION
-        ' ====================================================
-
-        AnalyzePlateGeometry( _
-            PartDoc,
-            Occurrence.Name,
-            NibProfile,
-            PhysicalThicknessMM,
-            CurrentOccurrenceTransform,
-            CurrentOccurrenceContext,
-            MinimumNibEdgeLengthMM,
-            ExternalEndClearanceMM,
-            InternalEndClearanceMM,
-            MaximumNibSpacingMM,
-            ExternalMinimumUsableLengthMM,
-            InternalMinimumUsableLengthMM,
-            MinimumNibCentreSeparationMM,
-            InternalMarkerCoordinates,
-            ExternalMarkerCoordinates,
-            NibPreviewPlacements,
-            NibPartPlacements)
-
-        ' Part-local placement frames are retained for the confirmed in-part geometry stage.
-
-
+        Stats.EligiblePlates += 1
+        AnalyzePlateGeometry(PartDoc, Occ.Name, NibProfile, PhysicalThicknessMM, CurrentTransform, _
+                             InternalMarkers, ExternalMarkers, Placements)
     Next
-
-
 End Sub
 
 
-
- ' ============================================================
-' NIB EDGE ANALYSIS - REPORT ONLY
-'
-' Version 0.4.8.2 retains the corrected 90-degree nib orientation and fixes the plate-thickness centring offset.
-'
-' Version 0.4.4 geometry strategy:
-'   - Identify the broad planar face, not merely any planar face.
-'   - Rank planar faces first by how many boundary edges are much
-'     longer than the measured sheet thickness, then by face area.
-'   - Analyse only boundary loops belonging to that broad face.
-'   - Report in-plane, thickness-direction and ambiguous edge orientations.
-'   - Classify straight edges by comparing their direction with the selected
-'     broad face normal (vector-angle method).
-'   - Use physical thickness only as a secondary sanity check.
-'   - Apply the selected nib profile after geometric classification.
-'   - Use independent clearances for internal openings and external perimeters.
-'   - Transform calculated nib centres into assembly coordinates and draw temporary markers.
-'   - Calculate candidate positions and both assembly-space and part-local nib placement frames.
-'
-' This is intended to handle rotated plates and angled outlines because
-' it does not depend on global X/Y/Z directions or rectangular shapes.
 ' ============================================================
-
+' PLATE BOUNDARY & CURVE ANALYSIS
+' ============================================================
 Sub AnalyzePlateGeometry( _
     PartDoc As Inventor.PartDocument, _
     OccurrenceName As String, _
     NibProfile As String, _
     PhysicalThicknessMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
-    TargetOccurrenceContext As Object, _
-    MinimumNibEdgeLengthMM As Double, _
-    ExternalEndClearanceMM As Double, _
-    InternalEndClearanceMM As Double, _
-    MaximumNibSpacingMM As Double, _
-    ExternalMinimumUsableLengthMM As Double, _
-    InternalMinimumUsableLengthMM As Double, _
-    MinimumNibCentreSeparationMM As Double, _
-    InternalMarkerCoordinates As System.Collections.ArrayList, _
-    ExternalMarkerCoordinates As System.Collections.ArrayList, _
-    NibPreviewPlacements As System.Collections.ArrayList, _
-    NibPartPlacements As System.Collections.ArrayList)
+    InternalMarkers As System.Collections.Generic.List(Of Double), _
+    ExternalMarkers As System.Collections.Generic.List(Of Double), _
+    Placements As System.Collections.Generic.List(Of NibPlacement))
 
-    Logger.Section("NIB EDGE ANALYSIS")
-    Logger.Info("Occurrence: " & OccurrenceName)
-    Logger.Info("Part file: " & System.IO.Path.GetFileNameWithoutExtension(PartDoc.FullFileName))
-    Logger.Info("Selected profile: " & NibProfile)
-    Logger.Info("Measured physical thickness supplied to analyser: " & _
-                Math.Round(PhysicalThicknessMM, 3) & " mm")
-
-    ' Angular tolerance used when comparing edge direction with the plate normal.
-    ' One degree is a starting diagnostic tolerance, not an engineering standard.
-    Dim OrientationToleranceDegrees As Double = 1.0
-    Logger.Info("Edge orientation angular tolerance: " & OrientationToleranceDegrees & " degrees")
-    Logger.Info("External perimeter end clearance: " & ExternalEndClearanceMM & " mm")
-    Logger.Info("Internal opening end clearance: " & InternalEndClearanceMM & " mm")
-    Logger.Info("Maximum centre-to-centre spacing: " & MaximumNibSpacingMM & " mm")
-    Logger.Info("External minimum usable length: " & ExternalMinimumUsableLengthMM & " mm")
-    Logger.Info("Internal minimum usable length: " & InternalMinimumUsableLengthMM & " mm")
-    Logger.Info("Minimum centre-to-centre separation: " & MinimumNibCentreSeparationMM & " mm")
-
-    Dim PartDef As Inventor.PartComponentDefinition = Nothing
-    Try
-        PartDef = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition)
-    Catch ex As Exception
-        Logger.Warning("Geometry analysis skipped: unable to access part definition. " & ex.Message)
-        Exit Sub
-    End Try
-
-    Dim BodiesAnalysed As Integer = 0
-    Dim LoopsAnalysed As Integer = 0
-    Dim EdgesAnalysed As Integer = 0
-    Dim CandidateEdges As Integer = 0
-    Dim RejectedEdges As Integer = 0
-    Dim CandidatePositions As Integer = 0
-    Dim BodyIndex As Integer = 0
-
-    Logger.Info("Surface bodies found: " & PartDef.SurfaceBodies.Count)
+    Logger.Section("ANALYSING PLATE: " & OccurrenceName)
+    Dim PartDef As Inventor.PartComponentDefinition = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition)
+    Dim ThicknessScaleThresholdMM As Double = Math.Max(PhysicalThicknessMM * 2.0, 1.0)
 
     For Each Body As Inventor.SurfaceBody In PartDef.SurfaceBodies
-        BodyIndex += 1
-        If Body Is Nothing Then Continue For
+        If Body Is Nothing OrElse Not Body.IsSolid Then Continue For
 
-        Logger.Info("Body " & BodyIndex & ": IsSolid=" & Body.IsSolid & _
-                    "; faces=" & Body.Faces.Count)
-
-        If Not Body.IsSolid Then
-            Logger.Warning("Body " & BodyIndex & " is a surface body, not a solid body; skipped.")
-            Continue For
-        End If
-
-        ' Find the broad planar face. The existing thickness-aware boundary score
-        ' selects a likely broad face; edge orientation is then classified
-        ' independently by comparing each edge direction with that face normal.
+        ' Select broad planar face by long boundary edge count, tie-breaking with area
         Dim MainFace As Inventor.Face = Nothing
-        Dim BestLongBoundaryEdgeCount As Integer = -1
+        Dim BestLongEdgeCount As Integer = -1
         Dim BestFaceArea As Double = -1
-        Dim PlanarFacesFound As Integer = 0
-        Dim FaceIndex As Integer = 0
-        Dim ThicknessScaleThresholdMM As Double = Math.Max(PhysicalThicknessMM * 2.0, 1.0)
 
         For Each Face As Inventor.Face In Body.Faces
-            FaceIndex += 1
-            If Face Is Nothing Then Continue For
-            If Not IsPlanarFaceForAnalysis(Face) Then Continue For
-
-            PlanarFacesFound += 1
-            Dim FaceArea As Double = TryGetFaceArea(Face)
-            Dim FaceAreaStatus As String = If(FaceArea > 0, "AREA AVAILABLE", "AREA UNAVAILABLE/ZERO")
-            Dim LongBoundaryEdgeCount As Integer = CountLongBoundaryEdges( _
-                PartDoc, Face, ThicknessScaleThresholdMM)
-
-            Logger.Debug("Body " & BodyIndex & ", face " & FaceIndex & _
-                         ": planar area=" & Math.Round(FaceArea, 6) & " (database area units; " & FaceAreaStatus & ")" & _
-                         "; boundary edges longer than " & _
-                         Math.Round(ThicknessScaleThresholdMM, 3) & " mm=" & _
-                         LongBoundaryEdgeCount)
-
-            If LongBoundaryEdgeCount > BestLongBoundaryEdgeCount OrElse _
-               (LongBoundaryEdgeCount = BestLongBoundaryEdgeCount AndAlso FaceArea > BestFaceArea) Then
+            If Face Is Nothing OrElse Face.SurfaceType <> Inventor.SurfaceTypeEnum.kPlaneSurface Then Continue For
+            Dim Area As Double = Face.Evaluator.Area
+            Dim LongEdges As Integer = CountLongBoundaryEdges(PartDoc, Face, ThicknessScaleThresholdMM)
+            If LongEdges > BestLongEdgeCount OrElse (LongEdges = BestLongEdgeCount AndAlso Area > BestFaceArea) Then
                 MainFace = Face
-                BestLongBoundaryEdgeCount = LongBoundaryEdgeCount
-                BestFaceArea = FaceArea
+                BestLongEdgeCount = LongEdges
+                BestFaceArea = Area
             End If
         Next
 
-        Logger.Info("Body " & BodyIndex & ": planar faces recognised=" & PlanarFacesFound)
-
-        If MainFace Is Nothing Then
-            Logger.Warning("No planar face found on body " & BodyIndex & "; body skipped. " & _
-                           "No fallback to a non-planar/side face was used, to avoid false edge candidates.")
-            Continue For
-        End If
-
-        If BestLongBoundaryEdgeCount < 3 Then
-            Logger.Warning("Selected face on body " & BodyIndex & " has only " & _
-                           BestLongBoundaryEdgeCount & " boundary edges longer than the thickness threshold. " & _
-                           "The geometry may not expose a clear broad plate face; results require review.")
-        End If
-
-        BodiesAnalysed += 1
-        Logger.Info("Selected broad planar face on body " & BodyIndex & _
-                    "; area=" & Math.Round(Math.Max(0, BestFaceArea), 6) & _
-                    " database area units (diagnostic/tie-break only); long boundary edges=" & _
-                    BestLongBoundaryEdgeCount & "; edge loops=" & MainFace.EdgeLoops.Count)
+        If MainFace Is Nothing Then Continue For
 
         For Each BoundaryLoop As Inventor.EdgeLoop In MainFace.EdgeLoops
-            LoopsAnalysed += 1
-
-            Dim IsOuterLoop As Boolean = False
-            Try
-                IsOuterLoop = BoundaryLoop.IsOuterEdgeLoop
-            Catch ex As Exception
-                Logger.Warning("Unable to classify boundary loop " & LoopsAnalysed & _
-                               "; loop skipped. " & ex.Message)
-                Continue For
-            End Try
-
-            Dim LoopType As String = If(IsOuterLoop, "EXTERNAL PERIMETER", "INTERNAL OPENING")
+            Dim IsOuter As Boolean = BoundaryLoop.IsOuterEdgeLoop
             Dim IncludeLoop As Boolean = False
-
             Select Case NibProfile
-                Case "Internal openings - all suitable edges", "Internal openings - long edges only"
-                    IncludeLoop = Not IsOuterLoop
-                Case "Internal openings + external perimeter"
-                    IncludeLoop = True
-                Case "External perimeter only"
-                    IncludeLoop = IsOuterLoop
-                Case Else
-                    IncludeLoop = Not IsOuterLoop
+                Case "Internal openings - all suitable edges", "Internal openings - long edges only" : IncludeLoop = Not IsOuter
+                Case "Internal openings + external perimeter" : IncludeLoop = True
+                Case "External perimeter only" : IncludeLoop = IsOuter
             End Select
+            If Not IncludeLoop Then Continue For
 
-            Logger.Info("Boundary loop " & LoopsAnalysed & ": " & LoopType & _
-                        If(IncludeLoop, " [IN SCOPE]", " [EXCLUDED BY PROFILE]"))
-
-Dim LongestEdgeMM As Double = 0
+            Dim LongestEdgeMM As Double = 0
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
-                Dim ThisLengthMM As Double = GetCurveEdgeLengthMM(PartDoc, Edge)
-                If ThisLengthMM > LongestEdgeMM Then LongestEdgeMM = ThisLengthMM
+                LongestEdgeMM = Math.Max(LongestEdgeMM, GetCurveEdgeLengthMM(PartDoc, Edge))
             Next
 
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
-                EdgesAnalysed += 1
+                If Not IsSupportedEdgeCurve(Edge) Then Continue For
 
                 Dim EdgeLengthMM As Double = GetCurveEdgeLengthMM(PartDoc, Edge)
-                Dim IsSupportedCurve As Boolean = IsSupportedEdgeCurve(Edge)
-                Dim EdgeTypeLabel As String = GetEdgeCurveTypeName(Edge)
                 Dim IsClosed As Boolean = IsClosedEdgeCurve(Edge)
-                Dim AlignmentWithNormal As Double = -1.0
-                Dim OrientationClass As String = ClassifyEdgeAgainstFaceNormal( _
-                    MainFace, Edge, OrientationToleranceDegrees, AlignmentWithNormal)
+                Dim OrientationClass As String = ClassifyEdgeAgainstFaceNormal(MainFace, Edge, NibConfig.OrientationToleranceDegrees)
 
-                Dim IsThicknessScaleEdge As Boolean = False
-                If PhysicalThicknessMM > 0 AndAlso IsSupportedCurve Then
-                    IsThicknessScaleEdge = (EdgeLengthMM <= PhysicalThicknessMM * 1.5)
+                If OrientationClass <> "IN-PLANE" Then Continue For
+                If PhysicalThicknessMM > 0 AndAlso EdgeLengthMM <= PhysicalThicknessMM * 1.5 Then Continue For
+                If EdgeLengthMM < NibConfig.MinimumNibEdgeLengthMM Then Continue For
+
+                Dim EndClearanceMM As Double = If(IsClosed, 0.0, If(IsOuter, NibConfig.ExternalEndClearanceMM, NibConfig.InternalEndClearanceMM))
+                Dim MinUsableMM As Double = If(IsOuter, NibConfig.ExternalMinimumUsableLengthMM, NibConfig.InternalMinimumUsableLengthMM)
+                Dim UsableLengthMM As Double = EdgeLengthMM - (2.0 * EndClearanceMM)
+
+                If UsableLengthMM < MinUsableMM Then Continue For
+                If NibProfile = "Internal openings - long edges only" AndAlso EdgeLengthMM < (LongestEdgeMM * NibConfig.LongEdgeThresholdRatio) Then Continue For
+
+                Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / NibConfig.MaximumNibSpacingMM))
+                If IsClosed AndAlso IntervalCount < 2 Then IntervalCount = 2
+                If IntervalCount < 1 Then IntervalCount = 1
+
+                Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
+                If ActualSpacingMM < NibConfig.MinimumNibCentreSeparationMM Then
+                    Logger.Info("Rejected edge (spacing " & Math.Round(ActualSpacingMM, 1) & " mm < min separation).")
+                    Continue For
                 End If
 
-                Dim AppliedEndClearanceMM As Double = If(IsClosed, 0.0, If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM))
-                Dim AppliedMinUsableMM As Double = If(IsOuterLoop, ExternalMinimumUsableLengthMM, InternalMinimumUsableLengthMM)
-
-                Dim IsCandidate As Boolean = IncludeLoop
-                Dim Reason As String = "Boundary permitted by selected profile"
-
-                If Not IsSupportedCurve Then
-                    IsCandidate = False
-                    Reason = "Unsupported edge geometry type (" & EdgeTypeLabel & ")"
-                ElseIf OrientationClass = "THICKNESS-DIRECTION" Then
-                    IsCandidate = False
-                    Reason = "Edge direction is parallel to the plate normal"
-                ElseIf OrientationClass = "AMBIGUOUS" OrElse OrientationClass = "UNAVAILABLE" Then
-                    IsCandidate = False
-                    Reason = "Edge orientation is ambiguous or could not be calculated"
-                ElseIf IsThicknessScaleEdge Then
-                    IsCandidate = False
-                    Reason = "Thickness-scale length validation failed; review edge geometry"
-                ElseIf Not IncludeLoop Then
-                    IsCandidate = False
-                    Reason = "Boundary excluded by selected profile"
-                ElseIf EdgeLengthMM < MinimumNibEdgeLengthMM Then
-                    IsCandidate = False
-                    Reason = "Below minimum edge length"
-                ElseIf EdgeLengthMM <= (2 * AppliedEndClearanceMM) Then
-                    IsCandidate = False
-                    Reason = "Insufficient length after boundary-specific end clearances"
-                ElseIf (EdgeLengthMM - (2 * AppliedEndClearanceMM)) < AppliedMinUsableMM Then
-                    IsCandidate = False
-                    Reason = "Usable length after boundary-specific end clearances is below the configured minimum"
-                ElseIf NibProfile = "Internal openings - long edges only" AndAlso _
-                       EdgeLengthMM < (LongestEdgeMM * 0.75) Then
-                    IsCandidate = False
-                    Reason = "Not a long side under the selected profile heuristic"
-                End If
-
-                Logger.Info("Edge " & EdgesAnalysed & _
-                            " | Type=" & EdgeTypeLabel & If(IsClosed, " (Closed)", "") & _
-                            " | Length=" & Math.Round(EdgeLengthMM, 2) & " mm" & _
-                            " | Orientation=" & OrientationClass & _
-                            " | Abs(dot)=" & If(AlignmentWithNormal >= 0, Math.Round(AlignmentWithNormal, 6).ToString(), "N/A") & _
-                            " | Boundary=SELECTED FACE LOOP" & _
-                            " | " & If(IsCandidate, "CANDIDATE", "REJECTED") & _
-                            " | " & Reason)
-
-                If IsCandidate Then
-                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * AppliedEndClearanceMM)
-
-                    Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
-                    If IsClosed AndAlso IntervalCount < 2 Then IntervalCount = 2
-                    If IntervalCount < 1 Then IntervalCount = 1
-                    Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
-
-                    If ActualSpacingMM < MinimumNibCentreSeparationMM Then
-                        IsCandidate = False
-                        Reason = "Even distribution would violate minimum centre-to-centre separation (" & _
-                                 Math.Round(ActualSpacingMM, 2) & " mm < " & MinimumNibCentreSeparationMM & " mm)"
-                        RejectedEdges += 1
-                        Logger.Info("  REJECTED AFTER DISTRIBUTION CHECK: " & Reason)
-                    Else
-                        CandidateEdges += 1
-                        Logger.Info("  Candidate positions from edge start (mm):")
-
-                        ' On closed curves (e.g., full circles), stop at IntervalCount - 1 so
-                        ' the final nib doesn't overlap the first nib at 0 mm.
-                        Dim MaxIndex As Integer = If(IsClosed, IntervalCount - 1, IntervalCount)
-
-                        For PositionIndex As Integer = 0 To MaxIndex
-                            Dim PositionMM As Double = AppliedEndClearanceMM + (PositionIndex * ActualSpacingMM)
-                            Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
-                            CandidatePositions += 1
-
-                            AddCandidateMarkerCoordinate(PartDoc, Edge, _
-                                PositionMM, OccurrenceTransform, IsOuterLoop, _
-                                InternalMarkerCoordinates, ExternalMarkerCoordinates)
-
-                            AddNibPreviewPlacement(PartDoc, MainFace, BoundaryLoop, Edge, _
-                                PositionMM, PhysicalThicknessMM, OccurrenceTransform, _
-                                TargetOccurrenceContext, NibPreviewPlacements, NibPartPlacements)
-                        Next
-
-                        Logger.Info("  Boundary type: " & LoopType)
-                        Logger.Info("  Applied end clearance: " & AppliedEndClearanceMM & " mm")
-                        Logger.Info("  Usable length: " & Math.Round(UsableLengthMM, 2) & " mm")
-                        Logger.Info("  Nib centre count: " & (MaxIndex + 1))
-                        Logger.Info("  Actual centre-to-centre spacing: " & Math.Round(ActualSpacingMM, 2) & _
-                                    " mm; permitted range: " & MinimumNibCentreSeparationMM & " to " & _
-                                    MaximumNibSpacingMM & " mm")
-                    End If
-                Else
-                    RejectedEdges += 1
-                End If
+                Dim MaxIndex As Integer = If(IsClosed, IntervalCount - 1, IntervalCount)
+                For PosIndex As Integer = 0 To MaxIndex
+                    Dim DistanceMM As Double = EndClearanceMM + (PosIndex * ActualSpacingMM)
+                    AddNibPlacementAndMarker( _
+                        PartDoc, MainFace, Edge, DistanceMM, PhysicalThicknessMM, _
+                        OccurrenceTransform, IsOuter, InternalMarkers, ExternalMarkers, Placements)
+                Next
             Next
         Next
     Next
-
-    Logger.Section("NIB ANALYSIS SUMMARY - " & OccurrenceName)
-    Logger.Info("Solid bodies analysed: " & BodiesAnalysed)
-    Logger.Info("Boundary loops analysed: " & LoopsAnalysed)
-    Logger.Info("Edges inspected: " & EdgesAnalysed)
-    Logger.Info("Candidate edges: " & CandidateEdges)
-    Logger.Info("Rejected edges: " & RejectedEdges)
-    Logger.Info("Calculated candidate positions: " & CandidatePositions)
-    Logger.Info("Calculated assembly-space placement frames: " & NibPreviewPlacements.Count)
-    Logger.Info("Part-local nib placement frames collected: " & NibPartPlacements.Count)
-    Logger.Warning("No geometry is changed during analysis. Geometry generation occurs only after the final confirmation in the main routine.")
-
 End Sub
 
 
-
 ' ============================================================
-' NIB REFERENCE FILE + ORIENTATION PREVIEW
+' NIB PLACEMENT FRAME & MARKER CALCULATION
 ' ============================================================
-
-Function ResolveNibReferenceFile(AssemblyDoc As Inventor.AssemblyDocument) As String
-    If AssemblyDoc Is Nothing Then Return ""
-    Try
-        Dim AssemblyFolder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
-        Dim ExpectedPath As String = System.IO.Path.Combine(AssemblyFolder, "3mm-STD-NIB.ipt")
-        If System.IO.File.Exists(ExpectedPath) Then Return ExpectedPath
-    Catch
-    End Try
-
-    Dim Dialog As New System.Windows.Forms.OpenFileDialog
-    Dialog.Title = "Select the nib reference part"
-    Dialog.Filter = "Inventor Part (*.ipt)|*.ipt"
-    Dialog.FileName = "3mm-STD-NIB.ipt"
-    Dialog.CheckFileExists = True
-    If Dialog.ShowDialog() = System.Windows.Forms.DialogResult.OK Then
-        Return Dialog.FileName
-    End If
-    Return ""
-End Function
-
-Sub AddNibPreviewPlacement( _
+Sub AddNibPlacementAndMarker( _
     PartDoc As Inventor.PartDocument, _
     BroadFace As Inventor.Face, _
-    BoundaryLoop As Inventor.EdgeLoop, _
     Edge As Inventor.Edge, _
     DistanceAlongEdgeMM As Double, _
     PhysicalThicknessMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
-    TargetOccurrenceContext As Object, _
-    Placements As System.Collections.ArrayList, _
-    PartPlacements As System.Collections.ArrayList)
+    IsOuterLoop As Boolean, _
+    InternalMarkers As System.Collections.Generic.List(Of Double), _
+    ExternalMarkers As System.Collections.Generic.List(Of Double), _
+    Placements As System.Collections.Generic.List(Of NibPlacement))
 
     Try
-        If PartDoc Is Nothing OrElse BroadFace Is Nothing OrElse BoundaryLoop Is Nothing OrElse Edge Is Nothing Then Exit Sub
-        If PhysicalThicknessMM <= 0 Then Exit Sub
-        If Not IsSupportedEdgeCurve(Edge) Then Exit Sub
-
-        ' Evaluate exact 3D point and unit tangent along any curve (line, arc, circle, ellipse, spline)
         Dim EdgePoint As Inventor.Point = Nothing
         Dim Tangent As Inventor.Vector = Nothing
         If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, EdgePoint, Tangent) Then Exit Sub
 
-        ' Get the TRUE outward topological normal of the solid broad face (always points away from metal)
+        ' Store marker coordinate if visual markers are enabled
+        If NibConfig.ShowCandidateMarkers Then
+            Dim MarkerPt As Inventor.Point = EdgePoint.Copy()
+            MarkerPt.TransformBy(OccurrenceTransform)
+            Dim TargetList = If(IsOuterLoop, ExternalMarkers, InternalMarkers)
+            TargetList.Add(MarkerPt.X) : TargetList.Add(MarkerPt.Y) : TargetList.Add(MarkerPt.Z)
+        End If
+
+        ' True topological outward normal of the solid broad face
         Dim FaceEval As Inventor.SurfaceEvaluator = BroadFace.Evaluator
         Dim PtArr() As Double = {EdgePoint.X, EdgePoint.Y, EdgePoint.Z}
-        Dim GuessParams() As Double = {}
-        Dim MaxDev() As Double = {}
-        Dim Params() As Double = {}
-        Dim SolNatures() As Inventor.SolutionNatureEnum = {}
-        FaceEval.GetParamAtPoint(PtArr, GuessParams, MaxDev, Params, SolNatures)
+        Dim Guess() As Double = {}, MaxDev() As Double = {}, Params() As Double = {}, SolNatures() As Inventor.SolutionNatureEnum = {}
+        FaceEval.GetParamAtPoint(PtArr, Guess, MaxDev, Params, SolNatures)
 
         Dim Normals() As Double = {}
         FaceEval.GetNormal(Params, Normals)
-        Dim OutwardFaceNormal As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-            Normals(0), Normals(1), Normals(2))
+        Dim OutwardFaceNormal As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Normals(0), Normals(1), Normals(2))
         If OutwardFaceNormal.Length < 0.000001 Then Exit Sub
         OutwardFaceNormal.Normalize()
 
-        ' Compute the in-plane vector perpendicular to the curve tangent
-        Dim CandidateOutward As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+        ' Perpendicular in-plane vector; probe 0.5 mm to guarantee it points AWAY from solid material
+        Dim OutwardEdge As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             (Tangent.Y * OutwardFaceNormal.Z) - (Tangent.Z * OutwardFaceNormal.Y), _
             (Tangent.Z * OutwardFaceNormal.X) - (Tangent.X * OutwardFaceNormal.Z), _
             (Tangent.X * OutwardFaceNormal.Y) - (Tangent.Y * OutwardFaceNormal.X))
-        If CandidateOutward.Length < 0.000001 Then Exit Sub
-        CandidateOutward.Normalize()
+        If OutwardEdge.Length < 0.000001 Then Exit Sub
+        OutwardEdge.Normalize()
 
-        ' Test a tiny 0.05 cm (0.5 mm) step along CandidateOutward.
-        ' If that test point lands ON the solid face material, flip the vector so it points OUTWARD.
-        Dim ProbeDistCM As Double = 0.05
-        Dim ProbePoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            EdgePoint.X + (CandidateOutward.X * ProbeDistCM), _
-            EdgePoint.Y + (CandidateOutward.Y * ProbeDistCM), _
-            EdgePoint.Z + (CandidateOutward.Z * ProbeDistCM))
-
-        Dim ClosestOnFace As Inventor.Point = BroadFace.GetClosestPointTo(ProbePoint)
-        Dim DistToFaceCM As Double = ProbePoint.DistanceTo(ClosestOnFace)
-
-        ' If the probe point is essentially on the broad face (distance < 0.01 cm), it stepped INTO the metal
-        If DistToFaceCM < 0.01 Then
-            CandidateOutward.ScaleBy(-1.0)
+        Dim ProbePt As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            EdgePoint.X + (OutwardEdge.X * 0.05), _
+            EdgePoint.Y + (OutwardEdge.Y * 0.05), _
+            EdgePoint.Z + (OutwardEdge.Z * 0.05))
+        If ProbePt.DistanceTo(BroadFace.GetClosestPointTo(ProbePt)) < 0.01 Then
+            OutwardEdge.ScaleBy(-1.0)
         End If
 
-        ' Build right-handed nib frame directly after the 90-degree roll about +Y:
-        '   +Y = Outward from the cut edge (projection direction of the nib)
-        '   +X = True outward face normal of the plate
-        '   +Z = X cross Y (runs along the edge tangent)
-        Dim YAxis As Inventor.Vector = CandidateOutward
+        ' Right-handed nib frame (+Y = outward from cut edge, +X = outward face normal, +Z = tangent)
+        Dim YAxis As Inventor.Vector = OutwardEdge
         Dim XAxis As Inventor.Vector = OutwardFaceNormal
         Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             (XAxis.Y * YAxis.Z) - (XAxis.Z * YAxis.Y), _
@@ -1225,1786 +374,456 @@ Sub AddNibPreviewPlacement( _
         If ZAxis.Length < 0.000001 Then Exit Sub
         ZAxis.Normalize()
 
-        ' Since XAxis is guaranteed to point outward from the solid face, moving by
-        ' -HalfThicknessCM along XAxis always moves into the plate mid-plane.
-        Dim HalfThicknessCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits( _
-            PhysicalThicknessMM / 2.0, "mm", "cm")
+        ' Centre origin on the plate mid-plane
+        Dim HalfThickCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits(PhysicalThicknessMM / 2.0, "mm", "cm")
         Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            EdgePoint.X - (XAxis.X * HalfThicknessCM), _
-            EdgePoint.Y - (XAxis.Y * HalfThicknessCM), _
-            EdgePoint.Z - (XAxis.Z * HalfThicknessCM))
+            EdgePoint.X - (XAxis.X * HalfThickCM), _
+            EdgePoint.Y - (XAxis.Y * HalfThickCM), _
+            EdgePoint.Z - (XAxis.Z * HalfThickCM))
 
-        ' Transform origin and basis vectors into assembly coordinates
-        Dim O As Inventor.Point = OriginPart.Copy()
-        O.TransformBy(OccurrenceTransform)
-        Dim XP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            OriginPart.X + XAxis.X, OriginPart.Y + XAxis.Y, OriginPart.Z + XAxis.Z)
-        XP.TransformBy(OccurrenceTransform)
-        Dim YP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            OriginPart.X + YAxis.X, OriginPart.Y + YAxis.Y, OriginPart.Z + YAxis.Z)
-        YP.TransformBy(OccurrenceTransform)
-        Dim ZP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            OriginPart.X + ZAxis.X, OriginPart.Y + ZAxis.Y, OriginPart.Z + ZAxis.Z)
-        ZP.TransformBy(OccurrenceTransform)
+        ' Transform frame to assembly coordinates
+        Dim O As Inventor.Point = OriginPart.Copy() : O.TransformBy(OccurrenceTransform)
+        Dim XP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(OriginPart.X + XAxis.X, OriginPart.Y + XAxis.Y, OriginPart.Z + XAxis.Z) : XP.TransformBy(OccurrenceTransform)
+        Dim YP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(OriginPart.X + YAxis.X, OriginPart.Y + YAxis.Y, OriginPart.Z + YAxis.Z) : YP.TransformBy(OccurrenceTransform)
+        Dim ZP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(OriginPart.X + ZAxis.X, OriginPart.Y + ZAxis.Y, OriginPart.Z + ZAxis.Z) : ZP.TransformBy(OccurrenceTransform)
 
-        Dim AX As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(XP.X - O.X, XP.Y - O.Y, XP.Z - O.Z)
-        Dim AY As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(YP.X - O.X, YP.Y - O.Y, YP.Z - O.Z)
-        Dim AZ As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(ZP.X - O.X, ZP.Y - O.Y, ZP.Z - O.Z)
-        AX.Normalize() : AY.Normalize() : AZ.Normalize()
+        Dim AX As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(XP.X - O.X, XP.Y - O.Y, XP.Z - O.Z) : AX.Normalize()
+        Dim AY As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(YP.X - O.X, YP.Y - O.Y, YP.Z - O.Z) : AY.Normalize()
+        Dim AZ As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(ZP.X - O.X, ZP.Y - O.Y, ZP.Z - O.Z) : AZ.Normalize()
 
-        Placements.Add(New Double() {O.X, O.Y, O.Z, AX.X, AX.Y, AX.Z, AY.X, AY.Y, AY.Z, AZ.X, AZ.Y, AZ.Z})
-
-        Dim StagingOccurrenceIndex As Integer = Placements.Count - 1
-        PartPlacements.Add(New Object() { _
-            PartDoc.FullFileName, _
-            OriginPart.X, OriginPart.Y, OriginPart.Z, _
-            XAxis.X, XAxis.Y, XAxis.Z, _
-            YAxis.X, YAxis.Y, YAxis.Z, _
-            ZAxis.X, ZAxis.Y, ZAxis.Z, _
-            OccurrenceTransform.Copy(), _
-            StagingOccurrenceIndex, _
-            TargetOccurrenceContext})
+        Dim P As New NibPlacement With { _
+            .PlatePath = PartDoc.FullFileName, _
+            .PartOrigin = OriginPart, .PartX = XAxis, .PartY = YAxis, .PartZ = ZAxis, _
+            .AsmOrigin = O, .AsmX = AX, .AsmY = AY, .AsmZ = AZ, _
+            .StagingIndex = Placements.Count}
+        Placements.Add(P)
     Catch ex As Exception
-        Logger.Debug("Nib placement frame calculation failed: " & ex.Message)
+        Logger.Debug("Nib frame calculation failed: " & ex.Message)
     End Try
 End Sub
 
-Function GetBoundaryLoopCentre(BoundaryLoop As Inventor.EdgeLoop) As Inventor.Point
-    Dim X As Double = 0, Y As Double = 0, Z As Double = 0
-    Dim Count As Integer = 0
-    For Each BoundaryEdge As Inventor.Edge In BoundaryLoop.Edges
-        If BoundaryEdge.StartVertex IsNot Nothing Then
-            X += BoundaryEdge.StartVertex.Point.X : Y += BoundaryEdge.StartVertex.Point.Y : Z += BoundaryEdge.StartVertex.Point.Z
-            Count += 1
-        End If
-    Next
-    If Count = 0 Then Return ThisApplication.TransientGeometry.CreatePoint(0, 0, 0)
-    Return ThisApplication.TransientGeometry.CreatePoint(X / Count, Y / Count, Z / Count)
+
+' ============================================================
+' STAGING OCCURRENCES & TRANSIENT B-REP SOLID JOIN
+' ============================================================
+Function ResolveNibReferenceFile(AssemblyDoc As Inventor.AssemblyDocument) As String
+    Try
+        Dim Folder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
+        Dim Expected As String = System.IO.Path.Combine(Folder, NibConfig.DefaultNibFileName)
+        If System.IO.File.Exists(Expected) Then Return Expected
+    Catch
+    End Try
+
+    Dim Dialog As New System.Windows.Forms.OpenFileDialog With { _
+        .Title = "Select the nib reference part", _
+        .Filter = "Inventor Part (*.ipt)|*.ipt", _
+        .FileName = NibConfig.DefaultNibFileName, _
+        .CheckFileExists = True}
+    Return If(Dialog.ShowDialog() = System.Windows.Forms.DialogResult.OK, Dialog.FileName, "")
 End Function
-
-
-' ============================================================
-' V0.5.2.4 - ASSEMBLY NIB STAGING OCCURRENCES
-'
-' Creates actual reference-part component occurrences using the exact
-' assembly-space frames calculated by the proven v0.4.8.2 placement routine.
-' The occurrence objects are retained until their corresponding plate transfer and joins succeed.
-' ============================================================
 
 Function CreateNibStagingOccurrences( _
     AssemblyDoc As Inventor.AssemblyDocument, _
     NibFilePath As String, _
-    AssemblyPlacements As System.Collections.ArrayList, _
-    StagingOccurrences As System.Collections.ArrayList, _
-    JoinOverlapMM As Double) As Boolean
+    Placements As System.Collections.Generic.List(Of NibPlacement), _
+    StagingOccurrences As System.Collections.Generic.List(Of Inventor.ComponentOccurrence)) As Boolean
 
-    CreateNibStagingOccurrences = False
-    If AssemblyDoc Is Nothing OrElse String.IsNullOrWhiteSpace(NibFilePath) Then Return False
-    If AssemblyPlacements Is Nothing OrElse AssemblyPlacements.Count = 0 Then Return False
-
-    Logger.Section("V0.5.2.4 - ASSEMBLY NIB SOURCE OCCURRENCES")
-    Logger.Info("Assembly-space placement frames: " & AssemblyPlacements.Count)
-    Logger.Info("Reference component: " & NibFilePath)
-
-    Dim Answer As System.Windows.Forms.DialogResult = System.Windows.Forms.MessageBox.Show( _
-        "Create " & AssemblyPlacements.Count & " temporary nib component occurrence(s) in the assembly?" & vbCrLf & vbCrLf & _
-        "These real component occurrences provide visible source geometry for the staged transfer workflow. " & _
-        "Each source occurrence is removed only after its corresponding plate completes all transfers and joins. Failed/skipped plate source occurrences are retained.", _
-        "Inventor Nib Automation - v0.5.2.3", _
-        System.Windows.Forms.MessageBoxButtons.YesNo, _
-        System.Windows.Forms.MessageBoxIcon.Warning)
-
-    If Answer <> System.Windows.Forms.DialogResult.Yes Then
-        Logger.Warning("User declined assembly source occurrence creation. No plate generation will be performed.")
-        Return False
-    End If
-
-    Dim Created As Integer = 0
+    Dim ToCreate As Integer = Math.Min(Placements.Count, NibConfig.MaxStagingOccurrences)
+    Dim OverlapCM As Double = AssemblyDoc.UnitsOfMeasure.ConvertUnits(NibConfig.NibJoinOverlapMM, "mm", "cm")
     Dim Failed As Integer = 0
-    Dim Limit As Integer = 300
-    Dim ToCreate As Integer = Math.Min(AssemblyPlacements.Count, Limit)
-    If AssemblyPlacements.Count > Limit Then
-        Logger.Warning("Assembly staging occurrence creation limited to " & Limit & " placements.")
-    End If
 
     For i As Integer = 0 To ToCreate - 1
         Try
-            Dim Values() As Double = CType(AssemblyPlacements(i), Double())
-            Dim M As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
-            Dim O As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(Values(0), Values(1), Values(2))
-            Dim X As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(3), Values(4), Values(5))
-            Dim Y As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(6), Values(7), Values(8))
-            Dim Z As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(Values(9), Values(10), Values(11))
-            ' Apply the intentional join overlap to the source occurrence itself.
-            ' Copy Object TargetOccurrence will perform the assembly-to-part mapping.
-            Dim OverlapCM As Double = AssemblyDoc.UnitsOfMeasure.ConvertUnits(JoinOverlapMM, "mm", "cm")
+            Dim P As NibPlacement = Placements(i)
             Dim OverlappedOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-                O.X - (Y.X * OverlapCM), O.Y - (Y.Y * OverlapCM), O.Z - (Y.Z * OverlapCM))
-            M.SetCoordinateSystem(OverlappedOrigin, X, Y, Z)
+                P.AsmOrigin.X - (P.AsmY.X * OverlapCM), _
+                P.AsmOrigin.Y - (P.AsmY.Y * OverlapCM), _
+                P.AsmOrigin.Z - (P.AsmY.Z * OverlapCM))
+            Dim M As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
+            M.SetCoordinateSystem(OverlappedOrigin, P.AsmX, P.AsmY, P.AsmZ)
 
-            Dim NibOccurrence As Inventor.ComponentOccurrence = _
-                AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, M)
-            If NibOccurrence Is Nothing Then Throw New Exception("Occurrences.Add returned Nothing.")
-            StagingOccurrences.Add(NibOccurrence)
-            Created += 1
+            Dim Occ As Inventor.ComponentOccurrence = AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, M)
+            If Occ Is Nothing Then Throw New Exception("Occurrences.Add returned Nothing.")
+            StagingOccurrences.Add(Occ)
         Catch ex As Exception
             Failed += 1
-            Logger.Error("Unable to create staging nib occurrence " & (i + 1) & ": " & ex.Message)
+            Logger.Error("Staging occurrence failed (" & (i + 1) & "): " & ex.Message)
         End Try
     Next
-
-    Logger.Info("Temporary assembly nib occurrences created: " & Created)
-    Logger.Info("Temporary assembly nib occurrences failed: " & Failed)
-    Logger.Info("Staging occurrence indices are aligned with the assembly-space and plate-local placement arrays.")
-
-    If Created = 0 OrElse Failed > 0 Then
-        Logger.Error("Staging occurrence creation was incomplete. Plate geometry generation has been stopped. Any successfully created occurrences are retained for inspection.")
-        Return False
-    End If
 
     ThisApplication.ActiveView.Update()
-    CreateNibStagingOccurrences = True
+    Return (StagingOccurrences.Count > 0 AndAlso Failed = 0)
 End Function
-
-
-Sub RemoveStagingOccurrenceAt( _
-    StagingOccurrences As System.Collections.ArrayList, _
-    StagingIndex As Integer)
-
-    If StagingOccurrences Is Nothing Then Exit Sub
-    If StagingIndex < 0 OrElse StagingIndex >= StagingOccurrences.Count Then Exit Sub
-
-    Try
-        Dim Occ As Inventor.ComponentOccurrence = _
-            TryCast(StagingOccurrences(StagingIndex), Inventor.ComponentOccurrence)
-        If Occ IsNot Nothing Then
-            Occ.Delete()
-            StagingOccurrences(StagingIndex) = Nothing
-            Logger.Success("Removed temporary nib source occurrence after successful plate transfer: index " & StagingIndex)
-        End If
-    Catch ex As Exception
-        Logger.Warning("Could not remove temporary nib source occurrence at index " & StagingIndex & ": " & ex.Message)
-    End Try
-End Sub
-
-Sub RemoveSuccessfulNibStagingOccurrences(StagingOccurrences As System.Collections.ArrayList)
-    If StagingOccurrences Is Nothing OrElse StagingOccurrences.Count = 0 Then Exit Sub
-
-    Logger.Section("V0.5.2.4 - STAGING OCCURRENCE CLEANUP")
-    Dim Removed As Integer = 0
-    Dim Failed As Integer = 0
-
-    For i As Integer = StagingOccurrences.Count - 1 To 0 Step -1
-        Try
-            Dim Occ As Inventor.ComponentOccurrence = TryCast(StagingOccurrences(i), Inventor.ComponentOccurrence)
-            If Occ IsNot Nothing Then
-                Occ.Delete()
-                Removed += 1
-            End If
-        Catch ex As Exception
-            Failed += 1
-            Logger.Warning("Could not remove temporary nib occurrence " & (i + 1) & ": " & ex.Message)
-        End Try
-    Next
-
-    Logger.Info("Temporary nib source occurrences removed after successful plate processing: " & Removed)
-    If Failed > 0 Then Logger.Warning("Temporary nib source occurrences that could not be removed: " & Failed)
-End Sub
-
-' ============================================================
-' V0.5.2.4 - TRANSIENT SOLID B-REP IN-PLATE NIB TRANSFER
-'
-' Transfer sequence:
-'   1. Obtain the native solid body from the matching temporary nib occurrence.
-'   2. Copy it into transient B-rep space using TransientBRep.Copy.
-'   3. Transform that transient solid using the proven plate-local placement frame.
-'   4. Create a non-associative solid NonParametricBaseFeature with AddByDefinition.
-'   5. Verify the feature and resulting body are solid, then Combine Join.
-'
-' The 0.2 mm overlap is applied along the plate-local nib +Y direction.
-' Failed plates retain their source nib occurrences; successful plates remove
-' only their own staging occurrences after all joins succeed.
-' ============================================================
 
 Sub GenerateNibGeometryInPlateParts( _
     NibFilePath As String, _
-    Placements As System.Collections.ArrayList, _
-    JoinOverlapMM As Double, _
-    ThicknessMatchToleranceMM As Double, _
-    StagingOccurrences As System.Collections.ArrayList)
+    Placements As System.Collections.Generic.List(Of NibPlacement), _
+    StagingOccurrences As System.Collections.Generic.List(Of Inventor.ComponentOccurrence))
 
-    If String.IsNullOrWhiteSpace(NibFilePath) OrElse Placements Is Nothing OrElse Placements.Count = 0 Then Exit Sub
-
-    Logger.Section("V0.5.2.4 - OCCURRENCE-BASED NIB TRANSFER AND COMBINE")
-    Logger.Info("Nib reference: " & NibFilePath)
-    Logger.Info("Part-local placement records: " & Placements.Count)
-    Logger.Info("Join overlap: " & JoinOverlapMM & " mm")
-    Logger.Warning("This operation modifies plate part documents in memory. No files are saved automatically.")
-
-    Dim Confirm As System.Windows.Forms.DialogResult = System.Windows.Forms.MessageBox.Show( _
-        "Generate and combine " & Placements.Count & " calculated nib placement(s)?" & vbCrLf & vbCrLf & _
-        "The rule will modify each eligible PL part document in memory:" & vbCrLf & _
-        "1. Create temporary nib component occurrences in the assembly as source/recovery geometry." & vbCrLf & _
-        "2. Copy each source occurrence body into its target plate using the Copy Object-style solid base-feature definition." & vbCrLf & _
-        "3. Verify solid output, then Join each nib to the plate with Combine (Join)." & vbCrLf & vbCrLf & _
-        "No documents are saved automatically. Test on a copy of your assembly first.", _
-        "Inventor Nib Automation - v0.5.2.3", _
-        System.Windows.Forms.MessageBoxButtons.YesNo, _
-        System.Windows.Forms.MessageBoxIcon.Warning)
-
-    If Confirm <> System.Windows.Forms.DialogResult.Yes Then
-        Logger.Info("User declined in-part nib geometry generation. No plate geometry was changed.")
-        Exit Sub
-    End If
-
-    Dim NibDoc As Inventor.PartDocument = Nothing
-    Try
-        NibDoc = CType(ThisApplication.Documents.Open(NibFilePath, False), Inventor.PartDocument)
-    Catch ex As Exception
-        Logger.Error("Unable to open nib reference part: " & ex.Message)
-        Exit Sub
-    End Try
-
-    Dim NibDef As Inventor.PartComponentDefinition = CType(NibDoc.ComponentDefinition, Inventor.PartComponentDefinition)
-    Dim NibBody As Inventor.SurfaceBody = Nothing
-    For Each SourceBody As Inventor.SurfaceBody In NibDef.SurfaceBodies
-        If SourceBody IsNot Nothing AndAlso SourceBody.IsSolid Then
-            If NibBody IsNot Nothing Then
-                Logger.Error("Nib reference contains more than one solid body. Select/prepare a single-solid nib part before generation.")
-                Exit Sub
-            End If
-            NibBody = SourceBody
-        End If
-    Next
+    Dim NibDoc As Inventor.PartDocument = CType(ThisApplication.Documents.Open(NibFilePath, False), Inventor.PartDocument)
+    Dim NibBody As Inventor.SurfaceBody = GetSingleSolidBody(CType(NibDoc.ComponentDefinition, Inventor.PartComponentDefinition))
     If NibBody Is Nothing Then
-        Logger.Error("Nib reference part contains no solid body. Generation stopped.")
+        Logger.Error("Nib reference part must contain exactly one solid body.")
         Exit Sub
     End If
 
-    Dim NibRange As Inventor.Box = NibBody.RangeBox
-    Dim NibThicknessCM As Double = Math.Abs(NibRange.MaxPoint.X - NibRange.MinPoint.X)
-    Dim NibThicknessMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibThicknessCM, "cm", "mm")
-    Dim NibMinYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MinPoint.Y, "cm", "mm")
-    Dim NibMaxYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MaxPoint.Y, "cm", "mm")
-    Logger.Info("Nib solid local X thickness: " & Math.Round(NibThicknessMM, 3) & " mm")
-    Logger.Info("Nib solid local Y range: " & _
-                Math.Round(NibMinYMM, 3) & " to " & Math.Round(NibMaxYMM, 3) & " mm")
+    Dim NibThicknessMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(Math.Abs(NibBody.RangeBox.MaxPoint.X - NibBody.RangeBox.MinPoint.X), "cm", "mm")
+    Dim NibMinYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MinPoint.Y, "cm", "mm")
+    Dim NibMaxYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MaxPoint.Y, "cm", "mm")
     If Math.Abs(NibMinYMM) > 0.1 OrElse NibMaxYMM <= NibMinYMM Then
-        Logger.Error("Nib solid does not appear to start at its ZX attachment plane (expected local Y minimum approximately 0 and projection towards +Y). Generation stopped to prevent incorrect attachment positioning.")
+        Logger.Error("Nib solid must start at ZX attachment plane (Y ~ 0) and project toward +Y.")
         Exit Sub
     End If
-    Logger.Info("Nib local +Y attachment-plane check: PASS")
-    Logger.Info("Nib solid local Z range: " & _
-                Math.Round(NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MinPoint.Z, "cm", "mm"), 3) & _
-                " to " & Math.Round(NibDoc.UnitsOfMeasure.ConvertUnits(NibRange.MaxPoint.Z, "cm", "mm"), 3) & " mm")
 
-    ' Process each unique plate file once. Repeated assembly occurrences of
-    ' the same IPT produce identical local placement frames, which are deduplicated.
-    Dim ProcessedFiles As New System.Collections.ArrayList
-    Dim TotalNibCopies As Integer = 0
-    Dim TotalNibJoins As Integer = 0
-    Dim FailedPlateFiles As Integer = 0
+    Dim ProcessedFiles As New System.Collections.Generic.HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
-    For Each Record As Object In Placements
-        Dim Values() As Object = CType(Record, Object())
-        Dim PlatePath As String = CStr(Values(0))
-        If ProcessedFiles.Contains(PlatePath) Then Continue For
-        ProcessedFiles.Add(PlatePath)
+    For Each P As NibPlacement In Placements
+        If ProcessedFiles.Contains(P.PlatePath) Then Continue For
+        ProcessedFiles.Add(P.PlatePath)
 
-        Dim PlateRecords As New System.Collections.ArrayList
-        For Each Candidate As Object In Placements
-            Dim CandidateValues() As Object = CType(Candidate, Object())
-            If String.Equals(CStr(CandidateValues(0)), PlatePath, StringComparison.OrdinalIgnoreCase) Then
-                PlateRecords.Add(Candidate)
-            End If
+        Dim PlateRecords As New System.Collections.Generic.List(Of NibPlacement)
+        For Each Candidate As NibPlacement In Placements
+            If String.Equals(Candidate.PlatePath, P.PlatePath, StringComparison.OrdinalIgnoreCase) Then PlateRecords.Add(Candidate)
         Next
 
-        Logger.Section("GENERATING NIBS - " & System.IO.Path.GetFileName(PlatePath))
-        Logger.Info("Raw placement records for this part: " & PlateRecords.Count)
-
-        Dim PlateDoc As Inventor.PartDocument = Nothing
-        Try
-            PlateDoc = CType(ThisApplication.Documents.Open(PlatePath, False), Inventor.PartDocument)
-        Catch ex As Exception
-            Logger.Error("Unable to open target plate part: " & ex.Message)
-            FailedPlateFiles += 1
-            Continue For
-        End Try
-
+        Dim PlateDoc As Inventor.PartDocument = CType(ThisApplication.Documents.Open(P.PlatePath, False), Inventor.PartDocument)
         Dim PlateDef As Inventor.PartComponentDefinition = CType(PlateDoc.ComponentDefinition, Inventor.PartComponentDefinition)
 
+        ' Skip if already generated
         Dim AlreadyGenerated As Boolean = False
-        For Each ExistingJoin As Inventor.CombineFeature In PlateDef.Features.CombineFeatures
-            If ExistingJoin IsNot Nothing AndAlso ExistingJoin.Name.StartsWith("NIB_AUTO_JOIN_", StringComparison.OrdinalIgnoreCase) Then
-                AlreadyGenerated = True
-                Exit For
-            End If
+        For Each JoinFeat As Inventor.CombineFeature In PlateDef.Features.CombineFeatures
+            If JoinFeat.Name.StartsWith("NIB_AUTO_JOIN_", StringComparison.OrdinalIgnoreCase) Then AlreadyGenerated = True : Exit For
         Next
-        If AlreadyGenerated Then
-            Logger.Warning("This plate already contains v0.5.x NIB_AUTO_JOIN features. Skipped to prevent duplicate nib generation. Remove/undo the previous generated features deliberately before rerunning.")
+        If AlreadyGenerated Then Continue For
+
+        Dim DummyParam As Double = 0
+        Dim PlateThicknessMM As Double = GetPhysicalPlateThicknessMM(PlateDoc, DummyParam)
+        If PlateThicknessMM <= 0 OrElse Math.Abs(PlateThicknessMM - NibThicknessMM) > NibConfig.NibThicknessMatchToleranceMM Then
+            Logger.Error("Thickness mismatch or unreadable on: " & System.IO.Path.GetFileName(P.PlatePath))
             Continue For
         End If
 
-        Dim PlateThicknessParameterMM As Double = 0
-        Dim PlateThicknessMM As Double = GetPhysicalPlateThicknessMM(PlateDoc, PlateThicknessParameterMM)
-        If PlateThicknessMM <= 0 Then
-            Logger.Error("Physical plate thickness could not be re-measured. Part skipped.")
-            FailedPlateFiles += 1
+        Dim BaseBody As Inventor.SurfaceBody = GetSingleSolidBody(PlateDef)
+        If BaseBody Is Nothing Then
+            Logger.Error("Expected single solid body in: " & System.IO.Path.GetFileName(P.PlatePath))
             Continue For
         End If
 
-        Logger.Info("Measured plate thickness: " & Math.Round(PlateThicknessMM, 3) & " mm")
-        If Math.Abs(PlateThicknessMM - NibThicknessMM) > ThicknessMatchToleranceMM Then
-            Logger.Error("Nib thickness (" & Math.Round(NibThicknessMM, 3) & _
-                         " mm) does not match plate thickness (" & Math.Round(PlateThicknessMM, 3) & _
-                         " mm) within " & ThicknessMatchToleranceMM & " mm. Part skipped to avoid a mismatched laser-cut profile.")
-            FailedPlateFiles += 1
-            Continue For
-        End If
-
-        Dim SolidBodyCount As Integer = 0
-        Dim BaseBody As Inventor.SurfaceBody = Nothing
-        For Each ExistingBody As Inventor.SurfaceBody In PlateDef.SurfaceBodies
-            If ExistingBody IsNot Nothing AndAlso ExistingBody.IsSolid Then
-                SolidBodyCount += 1
-                If BaseBody Is Nothing Then BaseBody = ExistingBody
-            End If
+        ' Deduplicate placements from multiple assembly instances of the same plate
+        Dim UniqueRecords As New System.Collections.Generic.List(Of NibPlacement)
+        Dim SeenKeys As New System.Collections.Generic.HashSet(Of String)
+        For Each Rec As NibPlacement In PlateRecords
+            Dim Key As String = Math.Round(Rec.PartOrigin.X, 4) & "|" & Math.Round(Rec.PartOrigin.Y, 4) & "|" & Math.Round(Rec.PartOrigin.Z, 4)
+            If SeenKeys.Add(Key) Then UniqueRecords.Add(Rec)
         Next
-        If SolidBodyCount <> 1 OrElse BaseBody Is Nothing Then
-            Logger.Error("Expected exactly one existing solid plate body; found " & SolidBodyCount & ". Part skipped to avoid joining to the wrong body.")
-            FailedPlateFiles += 1
-            Continue For
-        End If
 
-        ' Remove duplicate local frames caused by the same IPT being used
-        ' by multiple assembly occurrences.
-        Dim UniqueRecords As New System.Collections.ArrayList
-        Dim SeenKeys As New System.Collections.ArrayList
-        For Each Candidate As Object In PlateRecords
-            Dim V() As Object = CType(Candidate, Object())
-            Dim Key As String = BuildNibPlacementKey(V)
-            If Not SeenKeys.Contains(Key) Then
-                SeenKeys.Add(Key)
-                UniqueRecords.Add(Candidate)
-            End If
-        Next
-        Logger.Info("Unique nib positions for this plate: " & UniqueRecords.Count)
-
-        If UniqueRecords.Count = 0 Then Continue For
-
-        Dim PartTransaction As Inventor.Transaction = Nothing
-        Dim PartSucceeded As Boolean = False
-        Dim PartNibCopies As Integer = 0
-        Dim PartNibJoins As Integer = 0
+        Dim Tx As Inventor.Transaction = Nothing
+        Dim Succeeded As Boolean = False
+        Dim OverlapCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits(NibConfig.NibJoinOverlapMM, "mm", "cm")
 
         Try
-            PartTransaction = ThisApplication.TransactionManager.StartTransaction(PlateDoc, _
-                "Inventor Nib Automation v0.5.2.3 - Generate and Combine Nibs")
+            Tx = ThisApplication.TransactionManager.StartTransaction(PlateDoc, "Inventor Nib Automation - Generate Nibs")
 
-            For NibIndex As Integer = 0 To UniqueRecords.Count - 1
-                Dim V() As Object = CType(UniqueRecords(NibIndex), Object())
-                Dim Origin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-                    CDbl(V(1)), CDbl(V(2)), CDbl(V(3)))
-                Dim XAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(4)), CDbl(V(5)), CDbl(V(6)))
-                Dim YAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(7)), CDbl(V(8)), CDbl(V(9)))
-                Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(10)), CDbl(V(11)), CDbl(V(12)))
+            For i As Integer = 0 To UniqueRecords.Count - 1
+                Dim Rec As NibPlacement = UniqueRecords(i)
+                Dim SourceOcc As Inventor.ComponentOccurrence = StagingOccurrences(Rec.StagingIndex)
+                Dim SourceBody As Inventor.SurfaceBody = GetSingleSolidBody(CType(SourceOcc.Definition, Inventor.PartComponentDefinition))
 
-                ' Retrieve the exact temporary nib occurrence created from the
-                ' matching assembly-space placement frame. Its component definition
-                ' supplies the native solid body; its occurrence transform locates
-                ' that body in assembly coordinates.
-                Dim StagingIndex As Integer = CInt(V(14))
-                If StagingIndex < 0 OrElse StagingIndex >= StagingOccurrences.Count Then
-                    Throw New Exception("No matching assembly nib source occurrence exists for placement " & (NibIndex + 1))
-                End If
+                Dim CopiedBody As Inventor.SurfaceBody = ThisApplication.TransientBRep.Copy(SourceBody)
+                Dim OverlappedOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+                    Rec.PartOrigin.X - (Rec.PartY.X * OverlapCM), _
+                    Rec.PartOrigin.Y - (Rec.PartY.Y * OverlapCM), _
+                    Rec.PartOrigin.Z - (Rec.PartY.Z * OverlapCM))
 
-                Dim NibSourceOccurrence As Inventor.ComponentOccurrence = _
-                    TryCast(StagingOccurrences(StagingIndex), Inventor.ComponentOccurrence)
-                If NibSourceOccurrence Is Nothing Then
-                    Throw New Exception("Matching assembly nib source occurrence is invalid at placement " & (NibIndex + 1))
-                End If
+                Dim M As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
+                M.SetCoordinateSystem(OverlappedOrigin, Rec.PartX, Rec.PartY, Rec.PartZ)
+                ThisApplication.TransientBRep.Transform(CopiedBody, M)
 
-                Dim NibSourceDef As Inventor.PartComponentDefinition = _
-                    TryCast(NibSourceOccurrence.Definition, Inventor.PartComponentDefinition)
-                If NibSourceDef Is Nothing OrElse NibSourceDef.SurfaceBodies.Count < 1 Then
-                    Throw New Exception("Assembly nib occurrence has no accessible source part body at placement " & (NibIndex + 1))
-                End If
+                Dim BaseDef As Inventor.NonParametricBaseFeatureDefinition = PlateDef.Features.NonParametricBaseFeatures.CreateDefinition()
+                Dim Entities As Inventor.ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection()
+                Entities.Add(CopiedBody)
+                BaseDef.BRepEntities = Entities
+                BaseDef.OutputType = Inventor.BaseFeatureOutputTypeEnum.kSolidOutputType
+                BaseDef.IsAssociative = False
 
-                Dim NibSourceBody As Inventor.SurfaceBody = Nothing
-                For Each CandidateSourceBody As Inventor.SurfaceBody In NibSourceDef.SurfaceBodies
-                    If CandidateSourceBody IsNot Nothing AndAlso CandidateSourceBody.IsSolid Then
-                        If NibSourceBody IsNot Nothing Then
-                            Throw New Exception("Assembly nib source contains more than one solid body at placement " & (NibIndex + 1))
-                        End If
-                        NibSourceBody = CandidateSourceBody
-                    End If
-                Next
-                If NibSourceBody Is Nothing Then
-                    Throw New Exception("Assembly nib source occurrence contains no solid body at placement " & (NibIndex + 1))
-                End If
-
-                ' Create a true transient solid copy of the nib source body and
-                ' transform it directly into the target IPT's native coordinates.
-                '
-                ' The previous assembly-proxy route returned a surface feature in
-                ' Inventor for every nested target plate, despite kSolidOutputType.
-                ' This route avoids mixing a root-level staging occurrence proxy
-                ' with a nested ComponentOccurrenceProxy as TargetOccurrence.
-                ' AddByDefinition accepts transient solid B-rep entities directly.
-                Dim CopiedNibBody As Inventor.SurfaceBody = _
-                    ThisApplication.TransientBRep.Copy(NibSourceBody)
-                If CopiedNibBody Is Nothing OrElse Not CopiedNibBody.IsSolid Then
-                    Throw New Exception("Transient copy of source nib did not produce a solid at position " & (NibIndex + 1))
-                End If
-
-                ' V(1..12) is the proven nib placement frame in plate-part
-                ' coordinates: origin, local X, local Y, local Z.
-                Dim PartOrigin As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-                    CDbl(V(1)), CDbl(V(2)), CDbl(V(3)))
-                Dim PartXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(4)), CDbl(V(5)), CDbl(V(6)))
-                Dim PartYAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(7)), CDbl(V(8)), CDbl(V(9)))
-                Dim PartZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-                    CDbl(V(10)), CDbl(V(11)), CDbl(V(12)))
-
-                ' Preserve the configured 0.2 mm nib/plate overlap. The staging
-                ' occurrence is shifted inward along local +Y before transfer.
-                Dim OverlapCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits( _
-                    JoinOverlapMM, "mm", "cm")
-                PartOrigin.X -= PartYAxis.X * OverlapCM
-                PartOrigin.Y -= PartYAxis.Y * OverlapCM
-                PartOrigin.Z -= PartYAxis.Z * OverlapCM
-
-                Dim PartPlacementMatrix As Inventor.Matrix = _
-                    ThisApplication.TransientGeometry.CreateMatrix()
-                PartPlacementMatrix.SetCoordinateSystem( _
-                    PartOrigin, PartXAxis, PartYAxis, PartZAxis)
-                ThisApplication.TransientBRep.Transform(CopiedNibBody, PartPlacementMatrix)
-
-                If Not CopiedNibBody.IsSolid Then
-                    Throw New Exception("Transformed transient nib is no longer a solid at position " & (NibIndex + 1))
-                End If
-
-                Logger.Info("Nib " & (NibIndex + 1) & " source occurrence: " & NibSourceOccurrence.Name)
-                Logger.Info("Nib " & (NibIndex + 1) & " transient source copy: IsSolid=True")
-                Logger.Info("Nib " & (NibIndex + 1) & " placement transformed into target plate coordinates.")
-
-                Dim CopyDefinition As Inventor.NonParametricBaseFeatureDefinition = _
-                    PlateDef.Features.NonParametricBaseFeatures.CreateDefinition()
-                Dim CopyEntities As Inventor.ObjectCollection = _
-                    ThisApplication.TransientObjects.CreateObjectCollection()
-                CopyEntities.Add(CopiedNibBody)
-                CopyDefinition.BRepEntities = CopyEntities
-                CopyDefinition.OutputType = Inventor.BaseFeatureOutputTypeEnum.kSolidOutputType
-                CopyDefinition.IsAssociative = False
-
-                Logger.Info("Nib " & (NibIndex + 1) & " base feature definition: OutputType=kSolidOutputType; transient solid B-rep; target part coordinates")
-
-                Dim CopiedFeature As Inventor.NonParametricBaseFeature = _
-                    PlateDef.Features.NonParametricBaseFeatures.AddByDefinition(CopyDefinition)
-                If CopiedFeature Is Nothing Then
-                    Throw New Exception("Transient-solid AddByDefinition returned Nothing at nib position " & (NibIndex + 1))
-                End If
-                CopiedFeature.Name = "NIB_AUTO_BODY_" & (NibIndex + 1).ToString("0000")
-
-                Logger.Info("Nib " & (NibIndex + 1) & " base feature created; feature IsSolid=" & CopiedFeature.IsSolid.ToString())
-                If Not CopiedFeature.IsSolid Then
-                    Throw New Exception("Transient-solid base feature was created as a surface, not a solid, at position " & (NibIndex + 1))
-                End If
-                If CopiedFeature.SurfaceBodies.Count < 1 Then
-                    Throw New Exception("Transient-solid base feature returned no SurfaceBody at position " & (NibIndex + 1))
-                End If
-
-                Dim ToolBody As Inventor.SurfaceBody = Nothing
-                For Each ResultBody As Inventor.SurfaceBody In CopiedFeature.SurfaceBodies
-                    If ResultBody IsNot Nothing AndAlso ResultBody.IsSolid Then
-                        ToolBody = ResultBody
-                        Exit For
-                    End If
-                Next
-                If ToolBody Is Nothing Then
-                    Throw New Exception("Base feature reports solid output but contains no solid SurfaceBody at position " & (NibIndex + 1))
-                End If
-
-                Logger.Info("Nib " & (NibIndex + 1) & " copied solid volume (cm^3): " & _
-                            Math.Round(ToolBody.Volume(0.01), 6).ToString())
-                PartNibCopies += 1
+                Dim BaseFeat As Inventor.NonParametricBaseFeature = PlateDef.Features.NonParametricBaseFeatures.AddByDefinition(BaseDef)
+                BaseFeat.Name = "NIB_AUTO_BODY_" & (i + 1).ToString("0000")
 
                 Dim ToolBodies As Inventor.ObjectCollection = ThisApplication.TransientObjects.CreateObjectCollection()
-                ToolBodies.Add(ToolBody)
+                ToolBodies.Add(BaseFeat.SurfaceBodies(1))
 
-                ' Combine Join consumes the tool body on success. Reacquire
-                ' the resulting base body from the Combine feature for the next nib.
-                Logger.Info("Attempting Combine Join for nib " & (NibIndex + 1))
-                Dim JoinedFeature As Inventor.CombineFeature = PlateDef.Features.CombineFeatures.Add( _
+                Dim JoinFeat As Inventor.CombineFeature = PlateDef.Features.CombineFeatures.Add( _
                     BaseBody, ToolBodies, Inventor.PartFeatureOperationEnum.kJoinOperation, False)
-                If JoinedFeature Is Nothing OrElse JoinedFeature.SurfaceBodies.Count < 1 Then
-                    Throw New Exception("Combine Join returned no result at nib position " & (NibIndex + 1))
-                End If
-                JoinedFeature.Name = "NIB_AUTO_JOIN_" & (NibIndex + 1).ToString("0000")
-                BaseBody = Nothing
-                For Each JoinedBody As Inventor.SurfaceBody In JoinedFeature.SurfaceBodies
-                    If JoinedBody IsNot Nothing AndAlso JoinedBody.IsSolid Then
-                        BaseBody = JoinedBody
-                        Exit For
-                    End If
-                Next
-                If BaseBody Is Nothing Then
-                    Throw New Exception("Combine Join did not return a solid result at nib position " & (NibIndex + 1))
-                End If
-                PartNibJoins += 1
+                JoinFeat.Name = "NIB_AUTO_JOIN_" & (i + 1).ToString("0000")
+                BaseBody = JoinFeat.SurfaceBodies(1)
             Next
 
             PlateDoc.Update2(True)
-            PartTransaction.End()
-            PartTransaction = Nothing
-            PartSucceeded = True
+            Tx.End()
+            Succeeded = True
+            Logger.Success("Generated " & UniqueRecords.Count & " nibs on: " & System.IO.Path.GetFileName(P.PlatePath))
 
         Catch ex As Exception
-            Logger.Error("Plate generation failed: " & ex.Message)
-            If PartTransaction IsNot Nothing Then
-                Try
-                    PartTransaction.Abort()
-                    Logger.Warning("Inventor transaction aborted for this plate; partial nib changes should be rolled back.")
-                Catch AbortEx As Exception
-                    Logger.Error("Transaction abort also failed: " & AbortEx.Message)
-                End Try
-            End If
+            Logger.Error("Failed generating nibs on " & System.IO.Path.GetFileName(P.PlatePath) & ": " & ex.Message)
+            If Tx IsNot Nothing Then Try : Tx.Abort() : Catch : End Try
         End Try
 
-        If PartSucceeded Then
-            TotalNibCopies += PartNibCopies
-            TotalNibJoins += PartNibJoins
-            Logger.Success("Nib bodies copied into plate: " & PartNibCopies)
-            Logger.Success("Nib bodies joined to plate: " & PartNibJoins)
-            Logger.Info("Final solid body count: " & PlateDef.SurfaceBodies.Count)
-            Try
-                Dim SheetDef As Inventor.SheetMetalComponentDefinition = TryCast(PlateDoc.ComponentDefinition, Inventor.SheetMetalComponentDefinition)
-                If SheetDef IsNot Nothing Then
-                    If SheetDef.HasFlatPattern Then
-                        Logger.Warning("A flat pattern exists. Update/recompute and inspect it before DXF export; this rule has not exported a DXF.")
-                    Else
-                        Logger.Warning("No existing flat pattern is present. Test Create Flat Pattern in Inventor before relying on this part for DXF export.")
-                    End If
-                Else
-                    Logger.Warning("The modified document is not exposed as a SheetMetalComponentDefinition; flat-pattern compatibility requires manual review.")
-                End If
-            Catch FlatEx As Exception
-                Logger.Warning("Flat-pattern status could not be queried: " & FlatEx.Message)
-            End Try
-            Logger.Warning("Plate document is modified in memory but has NOT been saved. Inspect the geometry and flat pattern, then save manually if correct.")
-
-            ' This plate has completed every transfer and Combine Join.
-            ' Delete only the temporary nib occurrences that supplied this
-            ' plate's placement records. Failed/skipped plate sources remain.
-            Dim RemovedIndices As New System.Collections.ArrayList
-            For Each CompletedRecord As Object In PlateRecords
-                Dim CompletedValues() As Object = CType(CompletedRecord, Object())
-                Dim CompletedIndex As Integer = CInt(CompletedValues(14))
-                If Not RemovedIndices.Contains(CompletedIndex) Then
-                    RemovedIndices.Add(CompletedIndex)
-                    RemoveStagingOccurrenceAt(StagingOccurrences, CompletedIndex)
+        ' Remove temporary assembly nibs only if this plate succeeded
+        If Succeeded Then
+            For Each Completed As NibPlacement In PlateRecords
+                Dim Idx As Integer = Completed.StagingIndex
+                If Idx >= 0 AndAlso Idx < StagingOccurrences.Count AndAlso StagingOccurrences(Idx) IsNot Nothing Then
+                    Try : StagingOccurrences(Idx).Delete() : StagingOccurrences(Idx) = Nothing : Catch : End Try
                 End If
             Next
-        Else
-            FailedPlateFiles += 1
         End If
     Next
 
-    Logger.Section("V0.5.2.4 GENERATION SUMMARY")
-    Logger.Info("Unique plate part files processed: " & ProcessedFiles.Count)
-    Logger.Info("Nib solids copied: " & TotalNibCopies)
-    Logger.Info("Successful Combine Join operations: " & TotalNibJoins)
-    Logger.Info("Plate files skipped or rolled back: " & FailedPlateFiles)
-    Logger.Warning("No DXF files were exported. Flat-pattern validation and DXF export remain a subsequent controlled stage.")
-    Logger.Warning("Review all modified plate documents before saving. Close without saving to discard unapproved changes.")
-
-    ' Count actual remaining references; do not imply cleanup succeeded when no plate succeeded.
-    Dim RemainingStaging As Integer = 0
-    For Each RemainingOccurrence As Object In StagingOccurrences
-        If RemainingOccurrence IsNot Nothing Then RemainingStaging += 1
-    Next
-    Dim RemovedStaging As Integer = StagingOccurrences.Count - RemainingStaging
-    Logger.Info("Temporary nib source occurrences actually removed after successful plate processing: " & RemovedStaging)
-    Logger.Info("Temporary nib source occurrences retained for failed/skipped plates or cleanup diagnosis: " & RemainingStaging)
-
-    Try
-        ThisApplication.ActiveView.Update()
-    Catch
-    End Try
+    Try : ThisApplication.ActiveView.Update() : Catch : End Try
 End Sub
 
-Function BuildNibPlacementKey(V() As Object) As String
-    Dim Parts As New System.Collections.ArrayList
-    For I As Integer = 1 To 12
-        Parts.Add(Math.Round(CDbl(V(I)), 5).ToString("0.00000", System.Globalization.CultureInfo.InvariantCulture))
-    Next
-    Return String.Join("|", CType(Parts.ToArray(GetType(String)), String()))
-End Function
 
 ' ============================================================
-' TEMPORARY CANDIDATE MARKER GRAPHICS
+' CURVE & SOLID GEOMETRY HELPERS
 ' ============================================================
-
-Sub AddCandidateMarkerCoordinate( _
-    PartDoc As Inventor.PartDocument, _
-    Edge As Inventor.Edge, _
-    DistanceAlongEdgeMM As Double, _
-    OccurrenceTransform As Inventor.Matrix, _
-    IsExternal As Boolean, _
-    InternalCoordinates As System.Collections.ArrayList, _
-    ExternalCoordinates As System.Collections.ArrayList)
-
-    Try
-        If PartDoc Is Nothing OrElse Edge Is Nothing Then Exit Sub
-
-        Dim MarkerPoint As Inventor.Point = Nothing
-        Dim DummyTangent As Inventor.Vector = Nothing
-        If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, MarkerPoint, DummyTangent) Then Exit Sub
-
-        MarkerPoint.TransformBy(OccurrenceTransform)
-
-        Dim Target As System.Collections.ArrayList = If(IsExternal, ExternalCoordinates, InternalCoordinates)
-        Target.Add(CDbl(MarkerPoint.X))
-        Target.Add(CDbl(MarkerPoint.Y))
-        Target.Add(CDbl(MarkerPoint.Z))
-    Catch ex As Exception
-        Logger.Debug("Unable to calculate assembly-space marker coordinate: " & ex.Message)
-    End Try
-End Sub
-
-Sub DrawNibCandidateMarkers( _
-    AssemblyDoc As Inventor.AssemblyDocument, _
-    InternalCoordinates As System.Collections.ArrayList, _
-    ExternalCoordinates As System.Collections.ArrayList)
-
-    If AssemblyDoc Is Nothing Then Exit Sub
-
-    Const GraphicsId As String = "InventorNibAutomation_v048_CandidateMarkers"
-    Try
-        ' Remove markers from a previous run of this rule, if present.
-        Try
-            AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Item(GraphicsId).Delete()
-        Catch
-        End Try
-        Try
-            AssemblyDoc.GraphicsDataSetsCollection.Item(GraphicsId).Delete()
-        Catch
-        End Try
-
-        If InternalCoordinates.Count = 0 AndAlso ExternalCoordinates.Count = 0 Then
-            Logger.Warning("No candidate marker coordinates were generated; no visual markers displayed.")
-            Exit Sub
-        End If
-
-        Dim DataSets As Inventor.GraphicsDataSets = AssemblyDoc.GraphicsDataSetsCollection.Add(GraphicsId)
-        Dim ClientGraphics As Inventor.ClientGraphics = AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Add(GraphicsId)
-
-        If InternalCoordinates.Count > 0 Then
-            AddMarkerCrossGraphics(DataSets, ClientGraphics, InternalCoordinates, 1, 0, 180, 255)
-        End If
-        If ExternalCoordinates.Count > 0 Then
-            AddMarkerCrossGraphics(DataSets, ClientGraphics, ExternalCoordinates, 2, 255, 140, 0)
-        End If
-
-        ThisApplication.ActiveView.Update()
-        Logger.Success("Temporary nib candidate markers displayed in assembly: internal=" & _
-                       (InternalCoordinates.Count \ 3) & "; external=" & (ExternalCoordinates.Count \ 3))
-        Logger.Info("Marker graphics are transient ClientGraphics and are not saved as model geometry.")
-    Catch ex As Exception
-        Logger.Warning("Unable to display temporary candidate markers: " & ex.Message)
-    End Try
-End Sub
-
-
-Sub AddMarkerCrossGraphics( _
-    DataSets As Inventor.GraphicsDataSets, _
-    ClientGraphics As Inventor.ClientGraphics, _
-    Coordinates As System.Collections.ArrayList, _
-    NodeId As Integer, _
-    Red As Integer, _
-    Green As Integer, _
-    Blue As Integer)
-
-    Try
-        Dim LineCoordinates As New System.Collections.ArrayList
-        ' A small 3D cross (2 mm total span per axis) makes each candidate
-        ' visible without creating any sketch, feature, or physical component.
-        Dim HalfSizeCM As Double = 0.1
-        For i As Integer = 0 To Coordinates.Count - 1 Step 3
-            Dim X As Double = CDbl(Coordinates(i))
-            Dim Y As Double = CDbl(Coordinates(i + 1))
-            Dim Z As Double = CDbl(Coordinates(i + 2))
-            LineCoordinates.Add(X - HalfSizeCM) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z)
-            LineCoordinates.Add(X + HalfSizeCM) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z)
-            LineCoordinates.Add(X) : LineCoordinates.Add(Y - HalfSizeCM) : LineCoordinates.Add(Z)
-            LineCoordinates.Add(X) : LineCoordinates.Add(Y + HalfSizeCM) : LineCoordinates.Add(Z)
-            LineCoordinates.Add(X) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z - HalfSizeCM)
-            LineCoordinates.Add(X) : LineCoordinates.Add(Y) : LineCoordinates.Add(Z + HalfSizeCM)
-        Next
-
-        Dim CoordinateSet As Inventor.GraphicsCoordinateSet = DataSets.CreateCoordinateSet(NodeId)
-        Dim Values(LineCoordinates.Count - 1) As Double
-        For i As Integer = 0 To LineCoordinates.Count - 1
-            Values(i) = CDbl(LineCoordinates(i))
-        Next
-        CoordinateSet.PutCoordinates(Values)
-
-        Dim Node As Inventor.GraphicsNode = ClientGraphics.AddNode(NodeId)
-        Node.Selectable = False
-        Dim Lines As Inventor.LineGraphics = Node.AddLineGraphics()
-        Lines.CoordinateSet = CoordinateSet
-
-        Dim ColorSet As Inventor.GraphicsColorSet = DataSets.CreateColorSet(NodeId)
-        ColorSet.Add(1, Red, Green, Blue)
-        Lines.ColorSet = ColorSet
-    Catch ex As Exception
-        Logger.Warning("Unable to create one candidate marker group: " & ex.Message)
-    End Try
-End Sub
-
-
-Function ClassifyEdgeAgainstFaceNormal( _
-    Face As Inventor.Face, _
-    Edge As Inventor.Edge, _
-    ToleranceDegrees As Double, _
-    ByRef AbsoluteDotProduct As Double) As String
-
-    AbsoluteDotProduct = -1.0
-    If Face Is Nothing OrElse Edge Is Nothing Then Return "UNAVAILABLE"
-
-    Try
-        If Not IsSupportedEdgeCurve(Edge) Then Return "UNAVAILABLE"
-
-        Dim PlaneGeometry As Inventor.Plane = CType(Face.Geometry, Inventor.Plane)
-        Dim FaceNormal As Inventor.UnitVector = PlaneGeometry.Normal
-
-        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
-        Dim MinParam As Double = 0, MaxParam As Double = 0
-        Eval.GetParamExtents(MinParam, MaxParam)
-
-        Dim ToleranceRadians As Double = ToleranceDegrees * Math.PI / 180.0
-        Dim InPlaneLimit As Double = Math.Sin(ToleranceRadians)
-        Dim ThicknessLimit As Double = Math.Cos(ToleranceRadians)
-
-        ' Sample start, mid, and end tangents so 3D splines that leave the plane are caught
-        Dim SampleFractions() As Double = {0.1, 0.5, 0.9}
-        Dim MaxDot As Double = 0.0
-
-        For Each F As Double In SampleFractions
-            Dim Params(0) As Double
-            Params(0) = MinParam + ((MaxParam - MinParam) * F)
-            Dim Tangents() As Double = {}
-            Eval.GetTangent(Params, Tangents)
-
-            Dim Tx As Double = Tangents(0), Ty As Double = Tangents(1), Tz As Double = Tangents(2)
-            Dim Mag As Double = Math.Sqrt((Tx * Tx) + (Ty * Ty) + (Tz * Tz))
-            If Mag < 0.000001 Then Return "UNAVAILABLE"
-
-            Dim DotValue As Double = Math.Abs(((FaceNormal.X * Tx) + (FaceNormal.Y * Ty) + (FaceNormal.Z * Tz)) / Mag)
-            If DotValue > MaxDot Then MaxDot = DotValue
-        Next
-
-        AbsoluteDotProduct = Math.Min(MaxDot, 1.0)
-
-        If AbsoluteDotProduct <= InPlaneLimit Then
-            Return "IN-PLANE"
-        ElseIf AbsoluteDotProduct >= ThicknessLimit Then
-            Return "THICKNESS-DIRECTION"
-        Else
-            Return "AMBIGUOUS"
-        End If
-
-    Catch ex As Exception
-        Logger.Debug("Edge/face-normal vector comparison failed: " & ex.Message)
-        Return "UNAVAILABLE"
-    End Try
-End Function
-
-
-Function CountLongBoundaryEdges( _
-    PartDoc As Inventor.PartDocument, _
-    Face As Inventor.Face, _
-    MinimumLongEdgeLengthMM As Double) As Integer
-
-    Dim Count As Integer = 0
-    If PartDoc Is Nothing OrElse Face Is Nothing Then Return Count
-
-    Try
-        For Each BoundaryLoop As Inventor.EdgeLoop In Face.EdgeLoops
-            For Each Edge As Inventor.Edge In BoundaryLoop.Edges
-                If IsSupportedEdgeCurve(Edge) Then
-                    If GetCurveEdgeLengthMM(PartDoc, Edge) > MinimumLongEdgeLengthMM Then
-                        Count += 1
-                    End If
-                End If
-            Next
-        Next
-    Catch ex As Exception
-        Logger.Debug("Unable to score planar face boundary edges: " & ex.Message)
-    End Try
-
-    Return Count
-End Function
-
-
-Function IsPlanarFaceForAnalysis(Face As Inventor.Face) As Boolean
-    If Face Is Nothing Then Return False
-
-    Try
-        If Face.SurfaceType = Inventor.SurfaceTypeEnum.kPlaneSurface Then
-            Return True
-        End If
-    Catch
-        ' Try geometry type below.
-    End Try
-
-    Try
-        If TypeOf Face.Geometry Is Inventor.Plane Then
-            Return True
-        End If
-    Catch
-        ' Geometry type is not exposed as a Plane.
-    End Try
-
-    Return False
-End Function
-
-
-Function TryGetFaceArea(Face As Inventor.Face) As Double
-    If Face Is Nothing Then Return 0
-
-    Try
-        ' Face.Evaluator.Area is the Inventor SurfaceEvaluator area property.
-        ' Inventor database area units are cm^2. Face.Area is not used here,
-        ' because the evaluator is the documented geometry measurement route.
-        Dim FaceEvaluator As Inventor.SurfaceEvaluator = Face.Evaluator
-        Return FaceEvaluator.Area
-    Catch ex As Exception
-        Logger.Debug("Unable to retrieve planar face area from SurfaceEvaluator: " & ex.Message)
-        Return 0
-    End Try
-End Function
-
-
-' ------------------------------------------------------------
-' EDGE GEOMETRY HELPERS (LINES, ARCS, CIRCLES, ELLIPSES, SPLINES)
-' ------------------------------------------------------------
-
 Function IsSupportedEdgeCurve(Edge As Inventor.Edge) As Boolean
     If Edge Is Nothing Then Return False
-
-    Try
-        Select Case Edge.GeometryType
-            Case Inventor.CurveTypeEnum.kLineSegmentCurve, _
-                 Inventor.CurveTypeEnum.kCircularArcCurve, _
-                 Inventor.CurveTypeEnum.kCircleCurve, _
-                 Inventor.CurveTypeEnum.kEllipticalArcCurve, _
-                 Inventor.CurveTypeEnum.kEllipseFullCurve, _
-                 Inventor.CurveTypeEnum.kBSplineCurve
-                Return True
-            Case Else
-                Return False
-        End Select
-    Catch
-        Return False
-    End Try
+    Select Case Edge.GeometryType
+        Case Inventor.CurveTypeEnum.kLineSegmentCurve, Inventor.CurveTypeEnum.kCircularArcCurve, _
+             Inventor.CurveTypeEnum.kCircleCurve, Inventor.CurveTypeEnum.kEllipticalArcCurve, _
+             Inventor.CurveTypeEnum.kEllipseFullCurve, Inventor.CurveTypeEnum.kBSplineCurve
+            Return True
+        Case Else
+            Return False
+    End Select
 End Function
-
-
-Function GetEdgeCurveTypeName(Edge As Inventor.Edge) As String
-    If Edge Is Nothing Then Return "Unknown"
-    Try
-        Select Case Edge.GeometryType
-            Case Inventor.CurveTypeEnum.kLineSegmentCurve : Return "Straight"
-            Case Inventor.CurveTypeEnum.kCircularArcCurve : Return "Circular Arc"
-            Case Inventor.CurveTypeEnum.kCircleCurve : Return "Circle"
-            Case Inventor.CurveTypeEnum.kEllipticalArcCurve : Return "Elliptical Arc"
-            Case Inventor.CurveTypeEnum.kEllipseFullCurve : Return "Ellipse"
-            Case Inventor.CurveTypeEnum.kBSplineCurve : Return "Spline"
-            Case Else : Return Edge.GeometryType.ToString()
-        End Select
-    Catch
-        Return "Unknown"
-    End Try
-End Function
-
 
 Function IsClosedEdgeCurve(Edge As Inventor.Edge) As Boolean
-    If Edge Is Nothing Then Return False
-    Try
-        If Edge.GeometryType = Inventor.CurveTypeEnum.kCircleCurve OrElse _
-           Edge.GeometryType = Inventor.CurveTypeEnum.kEllipseFullCurve Then
-            Return True
-        End If
-
-        ' Also catch closed B-splines or arcs where start and end points coincide
-        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
-        Dim MinParam As Double = 0, MaxParam As Double = 0
-        Eval.GetParamExtents(MinParam, MaxParam)
-
-        Dim Params() As Double = {MinParam, MaxParam}
-        Dim Pts() As Double = {}
-        Eval.GetPointAtParam(Params, Pts)
-
-        Dim Dx As Double = Pts(3) - Pts(0)
-        Dim Dy As Double = Pts(4) - Pts(1)
-        Dim Dz As Double = Pts(5) - Pts(2)
-        Return Math.Sqrt((Dx * Dx) + (Dy * Dy) + (Dz * Dz)) < 0.0001
-    Catch
-        Return False
-    End Try
+    If Edge.GeometryType = Inventor.CurveTypeEnum.kCircleCurve OrElse Edge.GeometryType = Inventor.CurveTypeEnum.kEllipseFullCurve Then Return True
+    Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+    Dim MinP As Double = 0, MaxP As Double = 0
+    Eval.GetParamExtents(MinP, MaxP)
+    Dim Pts() As Double = {}
+    Eval.GetPointAtParam(New Double() {MinP, MaxP}, Pts)
+    Return Math.Sqrt(((Pts(3) - Pts(0)) ^ 2) + ((Pts(4) - Pts(1)) ^ 2) + ((Pts(5) - Pts(2)) ^ 2)) < 0.0001
 End Function
 
-
-Function GetCurveEdgeLengthMM( _
-    PartDoc As Inventor.PartDocument, _
-    Edge As Inventor.Edge) As Double
-
-    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return 0
-
-    Try
-        If Not IsSupportedEdgeCurve(Edge) Then Return 0
-
-        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
-        Dim MinParam As Double = 0, MaxParam As Double = 0
-        Eval.GetParamExtents(MinParam, MaxParam)
-
-        Dim LengthCM As Double = 0
-        Eval.GetLengthAtParam(MinParam, MaxParam, LengthCM)
-
-        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
-    Catch
-        Return 0
-    End Try
+Function GetCurveEdgeLengthMM(PartDoc As Inventor.PartDocument, Edge As Inventor.Edge) As Double
+    If Not IsSupportedEdgeCurve(Edge) Then Return 0
+    Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+    Dim MinP As Double = 0, MaxP As Double = 0, LengthCM As Double = 0
+    Eval.GetParamExtents(MinP, MaxP)
+    Eval.GetLengthAtParam(MinP, MaxP, LengthCM)
+    Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
 End Function
-
 
 Function TryEvaluateEdgeAtDistanceMM( _
-    PartDoc As Inventor.PartDocument, _
-    Edge As Inventor.Edge, _
-    DistanceAlongEdgeMM As Double, _
-    ByRef OutPoint As Inventor.Point, _
-    ByRef OutTangent As Inventor.Vector) As Boolean
-
-    OutPoint = Nothing
-    OutTangent = Nothing
-    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return False
+    PartDoc As Inventor.PartDocument, Edge As Inventor.Edge, DistanceMM As Double, _
+    ByRef OutPoint As Inventor.Point, ByRef OutTangent As Inventor.Vector) As Boolean
 
     Try
         Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
-        Dim MinParam As Double = 0, MaxParam As Double = 0
-        Eval.GetParamExtents(MinParam, MaxParam)
+        Dim MinP As Double = 0, MaxP As Double = 0
+        Eval.GetParamExtents(MinP, MaxP)
+        Dim DistCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits(DistanceMM, "mm", "cm")
+        Dim TargetP As Double = MinP
+        If DistCM > 0 Then Eval.GetParamAtLength(MinP, DistCM, TargetP)
 
-        Dim DistanceCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits(DistanceAlongEdgeMM, "mm", "cm")
-        Dim TargetParam As Double = MinParam
-
-        If DistanceCM > 0 Then
-            Eval.GetParamAtLength(MinParam, DistanceCM, TargetParam)
-        End If
-
-        Dim Params() As Double = {TargetParam}
-        Dim Pts() As Double = {}
-        Dim Tangents() As Double = {}
-
-        Eval.GetPointAtParam(Params, Pts)
-        Eval.GetTangent(Params, Tangents)
+        Dim Pts() As Double = {}, Tans() As Double = {}
+        Eval.GetPointAtParam(New Double() {TargetP}, Pts)
+        Eval.GetTangent(New Double() {TargetP}, Tans)
 
         OutPoint = ThisApplication.TransientGeometry.CreatePoint(Pts(0), Pts(1), Pts(2))
-        OutTangent = ThisApplication.TransientGeometry.CreateVector(Tangents(0), Tangents(1), Tangents(2))
+        OutTangent = ThisApplication.TransientGeometry.CreateVector(Tans(0), Tans(1), Tans(2))
         If OutTangent.Length < 0.000001 Then Return False
         OutTangent.Normalize()
-
         Return True
     Catch
         Return False
     End Try
 End Function
 
-Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
-    If Edge Is Nothing Then Return False
-
+Function ClassifyEdgeAgainstFaceNormal(Face As Inventor.Face, Edge As Inventor.Edge, ToleranceDeg As Double) As String
     Try
-        Return TypeOf Edge.Geometry Is Inventor.LineSegment
+        Dim FaceNormal As Inventor.UnitVector = CType(Face.Geometry, Inventor.Plane).Normal
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinP As Double = 0, MaxP As Double = 0
+        Eval.GetParamExtents(MinP, MaxP)
+
+        Dim MaxDot As Double = 0
+        For Each F As Double In New Double() {0.1, 0.5, 0.9}
+            Dim Tans() As Double = {}
+            Eval.GetTangent(New Double() {MinP + ((MaxP - MinP) * F)}, Tans)
+            Dim Mag As Double = Math.Sqrt((Tans(0) ^ 2) + (Tans(1) ^ 2) + (Tans(2) ^ 2))
+            If Mag < 0.000001 Then Return "UNAVAILABLE"
+            MaxDot = Math.Max(MaxDot, Math.Abs(((FaceNormal.X * Tans(0)) + (FaceNormal.Y * Tans(1)) + (FaceNormal.Z * Tans(2))) / Mag))
+        Next
+
+        Dim TolRad As Double = ToleranceDeg * Math.PI / 180.0
+        If MaxDot <= Math.Sin(TolRad) Then Return "IN-PLANE"
+        If MaxDot >= Math.Cos(TolRad) Then Return "THICKNESS-DIRECTION"
+        Return "AMBIGUOUS"
     Catch
-        Return False
+        Return "UNAVAILABLE"
     End Try
 End Function
 
+Function CountLongBoundaryEdges(PartDoc As Inventor.PartDocument, Face As Inventor.Face, MinLengthMM As Double) As Integer
+    Dim Count As Integer = 0
+    For Each LoopObj As Inventor.EdgeLoop In Face.EdgeLoops
+        For Each Edge As Inventor.Edge In LoopObj.Edges
+            If GetCurveEdgeLengthMM(PartDoc, Edge) > MinLengthMM Then Count += 1
+        Next
+    Next
+    Return Count
+End Function
 
-Function GetStraightEdgeLengthMM( _
-    PartDoc As Inventor.PartDocument, _
-    Edge As Inventor.Edge) As Double
+Function GetSingleSolidBody(PartDef As Inventor.PartComponentDefinition) As Inventor.SurfaceBody
+    Dim Found As Inventor.SurfaceBody = Nothing
+    For Each B As Inventor.SurfaceBody In PartDef.SurfaceBodies
+        If B IsNot Nothing AndAlso B.IsSolid Then
+            If Found IsNot Nothing Then Return Nothing
+            Found = B
+        End If
+    Next
+    Return Found
+End Function
 
-    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return 0
-
+Function GetPhysicalPlateThicknessMM(PartDoc As Inventor.PartDocument, ByRef ParamThicknessMM As Double) As Double
     Try
-        If Not IsStraightEdge(Edge) Then Return 0
-        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Return 0
+        Dim SMDef As Inventor.SheetMetalComponentDefinition = CType(PartDoc.ComponentDefinition, Inventor.SheetMetalComponentDefinition)
+        Try : ParamThicknessMM = PartDoc.UnitsOfMeasure.ConvertUnits(SMDef.Thickness.Value, "cm", "mm") : Catch : End Try
 
-        ' Inventor database length units are centimetres; convert to mm.
-        Dim LengthCM As Double = Edge.StartVertex.Point.DistanceTo(Edge.StopVertex.Point)
-        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
+        Dim Box As Inventor.OrientedBox = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition).OrientedMinimumRangeBox
+        Dim D1 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionOne.Length, "cm", "mm")
+        Dim D2 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionTwo.Length, "cm", "mm")
+        Dim D3 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionThree.Length, "cm", "mm")
+        Return Math.Min(D1, Math.Min(D2, D3))
     Catch
         Return 0
     End Try
 End Function
 
+Function TryParsePartType(Name As String, ByRef ComponentType As String) As Boolean
+    Dim M = System.Text.RegularExpressions.Regex.Match(Name, "^[0-9]{4}-[A-Za-z]{3}-([A-Za-z]{2})[0-9]{2}-[0-9]{2}$")
+    If Not M.Success Then Return False
+    ComponentType = M.Groups(1).Value.ToUpper()
+    Return True
+End Function
+
 
 ' ============================================================
-' SHEET METAL CHECK
+' CLIENT GRAPHICS MARKERS (CONTROLLED BY NibConfig.ShowCandidateMarkers)
 ' ============================================================
+Sub UpdateCandidateMarkers( _
+    AssemblyDoc As Inventor.AssemblyDocument, _
+    InternalCoords As System.Collections.Generic.List(Of Double), _
+    ExternalCoords As System.Collections.Generic.List(Of Double))
 
-Function IsSheetMetalPart( _
-    PartDoc As Inventor.PartDocument) As Boolean
-
-
+    Const GraphicsId As String = "InventorNibAutomation_CandidateMarkers"
     Try
+        Try : AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Item(GraphicsId).Delete() : Catch : End Try
+        Try : AssemblyDoc.GraphicsDataSetsCollection.Item(GraphicsId).Delete() : Catch : End Try
 
-
-        Dim Definition As Inventor.ComponentDefinition = _
-            PartDoc.ComponentDefinition
-
-
-        If TypeOf Definition Is _
-            Inventor.SheetMetalComponentDefinition Then
-
-            Return True
-
+        If Not NibConfig.ShowCandidateMarkers OrElse (InternalCoords.Count = 0 AndAlso ExternalCoords.Count = 0) Then
+            ThisApplication.ActiveView.Update()
+            Exit Sub
         End If
 
+        Dim DataSets As Inventor.GraphicsDataSets = AssemblyDoc.GraphicsDataSetsCollection.Add(GraphicsId)
+        Dim Graphics As Inventor.ClientGraphics = AssemblyDoc.ComponentDefinition.ClientGraphicsCollection.Add(GraphicsId)
 
-    Catch ex As Exception
-
-        Logger.Debug( _
-            "Sheet metal check failed: " & _
-            ex.Message)
-
+        If InternalCoords.Count > 0 Then DrawCrossGroup(DataSets, Graphics, InternalCoords, 1, 0, 180, 255)
+        If ExternalCoords.Count > 0 Then DrawCrossGroup(DataSets, Graphics, ExternalCoords, 2, 255, 140, 0)
+        ThisApplication.ActiveView.Update()
+    Catch
     End Try
-
-
-    Return False
-
-
-End Function
-
-
-
-' ============================================================
-' GET PHYSICAL PLATE THICKNESS
-'
-' IMPORTANT:
-'
-' This function measures the physical geometry.
-'
-' It does NOT use the sheet-metal thickness parameter as the
-' thickness returned to the automation.
-'
-' The sheet-metal parameter is read only so that we can detect
-' and report discrepancies.
-'
-' Inventor's OrientedMinimumRangeBox provides the minimum
-' oriented dimensions of the component geometry.
-'
-' ============================================================
-
-Function GetPhysicalPlateThicknessMM( _
-    PartDoc As Inventor.PartDocument, _
-    ByRef ParameterThicknessMM As Double) As Double
-
-
-    ParameterThicknessMM = 0
-
-
-    Try
-
-
-        ' ----------------------------------------------------
-        ' GET SHEET METAL DEFINITION
-        ' ----------------------------------------------------
-
-        Dim SheetMetalDef As _
-            Inventor.SheetMetalComponentDefinition = _
-            CType( _
-                PartDoc.ComponentDefinition, _
-                Inventor.SheetMetalComponentDefinition)
-
-
-        ' ----------------------------------------------------
-        ' READ PARAMETER ONLY FOR COMPARISON
-        ' ----------------------------------------------------
-
-        Try
-
-            ParameterThicknessMM = _
-                PartDoc.UnitsOfMeasure.ConvertUnits( _
-                    SheetMetalDef.Thickness.Value, _
-                    "cm", _
-                    "mm")
-
-        Catch
-
-            ParameterThicknessMM = 0
-
-        End Try
-
-
-        ' ----------------------------------------------------
-        ' GET PHYSICAL GEOMETRY
-        ' ----------------------------------------------------
-
-        Dim PartDef As Inventor.PartComponentDefinition = _
-            CType( _
-                PartDoc.ComponentDefinition, _
-                Inventor.PartComponentDefinition)
-
-
-        Dim MinimumBox As Inventor.OrientedBox = _
-            PartDef.OrientedMinimumRangeBox
-
-
-        ' ----------------------------------------------------
-        ' GET THE THREE PHYSICAL DIMENSIONS
-        '
-        ' Direction lengths are returned in Inventor's
-        ' database units (cm).
-        ' ----------------------------------------------------
-
-        Dim DimensionOneMM As Double = _
-            PartDoc.UnitsOfMeasure.ConvertUnits( _
-                MinimumBox.DirectionOne.Length, _
-                "cm", _
-                "mm")
-
-
-        Dim DimensionTwoMM As Double = _
-            PartDoc.UnitsOfMeasure.ConvertUnits( _
-                MinimumBox.DirectionTwo.Length, _
-                "cm", _
-                "mm")
-
-
-        Dim DimensionThreeMM As Double = _
-            PartDoc.UnitsOfMeasure.ConvertUnits( _
-                MinimumBox.DirectionThree.Length, _
-                "cm", _
-                "mm")
-
-
-        ' ----------------------------------------------------
-        ' SMALLEST PHYSICAL DIMENSION
-        '
-        ' For a flat plate this is the material thickness.
-        ' ----------------------------------------------------
-
-        Dim PhysicalThicknessMM As Double = _
-            Math.Min( _
-                DimensionOneMM, _
-                Math.Min( _
-                    DimensionTwoMM, _
-                    DimensionThreeMM))
-
-
-        If PhysicalThicknessMM <= 0 Then
-
-            Return 0
-
-        End If
-
-
-        Return PhysicalThicknessMM
-
-
-    Catch ex As Exception
-
-
-        Logger.Debug( _
-            "Physical thickness measurement failed: " & _
-            ex.Message)
-
-
-        Return 0
-
-
-    End Try
-
-
-End Function
-
-
-
-' ============================================================
-' PART NAME DATA
-' ============================================================
-
-Class PartNameData
-
-    Public IsValid As Boolean = False
-
-    Public ProjectNumber As String
-
-    Public ProjectIdentifier As String
-
-    Public ComponentType As String
-
-    Public ComponentNumber As String
-
-    Public Revision As String
-
-End Class
-
-
-
-' ============================================================
-' PARSE PART NAME
-'
-' Format:
-'
-' XXXX-CCC-VVBB-NN
-'
-' Example:
-'
-' 9187-DCS-PL07-03
-'
-' ============================================================
-
-Function ParsePartName( _
-    Name As String) As PartNameData
-
-
-    Dim Result As New PartNameData
-
-
-    Dim Pattern As String = _
-        "^([0-9]{4})-([A-Za-z]{3})-([A-Za-z]{2})([0-9]{2})-([0-9]{2})$"
-
-
-    Dim Match As _
-        System.Text.RegularExpressions.Match = _
-        System.Text.RegularExpressions.Regex.Match( _
-            Name, _
-            Pattern)
-
-
-    If Not Match.Success Then
-
-        Return Result
-
-    End If
-
-
-    Result.IsValid = True
-
-
-    Result.ProjectNumber = _
-        Match.Groups(1).Value
-
-
-    Result.ProjectIdentifier = _
-        Match.Groups(2).Value
-
-
-    Result.ComponentType = _
-        Match.Groups(3).Value.ToUpper()
-
-
-    Result.ComponentNumber = _
-        Match.Groups(4).Value
-
-
-    Result.Revision = _
-        Match.Groups(5).Value
-
-
-    Return Result
-
-
-End Function
-
-
-
-' ============================================================
-' ASSEMBLY NAME DATA
-' ============================================================
-
-Class AssemblyNameData
-
-    Public IsValid As Boolean = False
-
-    Public ProjectNumber As String
-
-    Public Description As String
-
-    Public AssemblyType As String
-
-    Public AssemblyNumber As String
-
-    Public Revision As String
-
-End Class
-
-
-
-' ============================================================
-' PARSE ASSEMBLY NAME
-'
-' Format:
-'
-' XXXX-DESCRIPTION-TTNN-VV
-'
-' Examples:
-'
-' 9187-DitchCrossingSlab-GA01-01
-' 9187-InternalStructure-SA01-01
-'
-' ============================================================
-
-Function ParseAssemblyName( _
-    Name As String) As AssemblyNameData
-
-
-    Dim Result As New AssemblyNameData
-
-
-    Dim Pattern As String = _
-        "^([0-9]{4})-(.+)-([A-Za-z]{2})([0-9]{2})-([0-9]{2})$"
-
-
-    Dim Match As _
-        System.Text.RegularExpressions.Match = _
-        System.Text.RegularExpressions.Regex.Match( _
-            Name, _
-            Pattern)
-
-
-    If Not Match.Success Then
-
-        Return Result
-
-    End If
-
-
-    Result.IsValid = True
-
-
-    Result.ProjectNumber = _
-        Match.Groups(1).Value
-
-
-    Result.Description = _
-        Match.Groups(2).Value
-
-
-    Result.AssemblyType = _
-        Match.Groups(3).Value.ToUpper()
-
-
-    Result.AssemblyNumber = _
-        Match.Groups(4).Value
-
-
-    Result.Revision = _
-        Match.Groups(5).Value
-
-
-    Return Result
-
-
-End Function
-
-
-
-' ============================================================
-' DISPLAY LOG
-'
-' Scrollable log window.
-'
-' ============================================================
-
-Sub ShowLog()
-
-
-    Dim LogText As String = _
-        Logger.GetText()
-
-
-    Dim LogForm As New System.Windows.Forms.Form
-
-
-    LogForm.Text = _
-        "Inventor Nib Automation Log"
-
-
-    LogForm.StartPosition = _
-        System.Windows.Forms.FormStartPosition.CenterScreen
-
-
-    LogForm.Width = 1000
-
-    LogForm.Height = 700
-
-
-    LogForm.MaximizeBox = True
-
-    LogForm.MinimizeBox = True
-
-
-    ' --------------------------------------------------------
-    ' LOG TEXT BOX
-    ' --------------------------------------------------------
-
-    Dim LogBox As New System.Windows.Forms.TextBox
-
-
-    LogBox.Multiline = True
-
-    LogBox.ReadOnly = True
-
-
-    LogBox.ScrollBars = _
-        System.Windows.Forms.ScrollBars.Both
-
-
-    LogBox.WordWrap = False
-
-
-    LogBox.Dock = _
-        System.Windows.Forms.DockStyle.Fill
-
-
-    LogBox.Text = LogText
-
-
-    ' --------------------------------------------------------
-    ' CLOSE BUTTON
-    ' --------------------------------------------------------
-
-    Dim CloseButton As _
-        New System.Windows.Forms.Button
-
-
-    CloseButton.Text = "Close"
-
-
-    CloseButton.Width = 100
-
-    CloseButton.Height = 30
-
-
-    CloseButton.Dock = _
-        System.Windows.Forms.DockStyle.Bottom
-
-
-    CloseButton.DialogResult = _
-        System.Windows.Forms.DialogResult.OK
-
-
-    ' --------------------------------------------------------
-    ' ADD CONTROLS
-    ' --------------------------------------------------------
-
-    LogForm.Controls.Add(LogBox)
-
-    LogForm.Controls.Add(CloseButton)
-
-
-    ' --------------------------------------------------------
-    ' BUTTON BEHAVIOUR
-    ' --------------------------------------------------------
-
-    LogForm.AcceptButton = CloseButton
-
-    LogForm.CancelButton = CloseButton
-
-
-    ' --------------------------------------------------------
-    ' DISPLAY
-    ' --------------------------------------------------------
-
-    LogForm.ShowDialog()
-
-
+End Sub
+
+Sub DrawCrossGroup( _
+    DataSets As Inventor.GraphicsDataSets, Graphics As Inventor.ClientGraphics, _
+    Coords As System.Collections.Generic.List(Of Double), NodeId As Integer, R As Integer, G As Integer, B As Integer)
+
+    Dim Lines As New System.Collections.Generic.List(Of Double)
+    Dim H As Double = 0.1
+    For i As Integer = 0 To Coords.Count - 1 Step 3
+        Dim X As Double = Coords(i), Y As Double = Coords(i + 1), Z As Double = Coords(i + 2)
+        Lines.AddRange(New Double() {X - H, Y, Z, X + H, Y, Z, X, Y - H, Z, X, Y + H, Z, X, Y, Z - H, X, Y, Z + H})
+    Next
+
+    Dim CoordSet As Inventor.GraphicsCoordinateSet = DataSets.CreateCoordinateSet(NodeId)
+    CoordSet.PutCoordinates(Lines.ToArray())
+    Dim Node As Inventor.GraphicsNode = Graphics.AddNode(NodeId)
+    Node.Selectable = False
+    Dim LineGfx As Inventor.LineGraphics = Node.AddLineGraphics()
+    LineGfx.CoordinateSet = CoordSet
+    Dim ColorSet As Inventor.GraphicsColorSet = DataSets.CreateColorSet(NodeId)
+    ColorSet.Add(1, R, G, B)
+    LineGfx.ColorSet = ColorSet
 End Sub
 
 
-
 ' ============================================================
-' LOGGER
-'
-' Central logging system for the entire automation.
-'
+' SILENT FILE LOGGER (CONTROLLED BY NibConfig.EnableDiagnosticLog)
 ' ============================================================
+Sub SaveLogIfEnabled(AssemblyDoc As Inventor.AssemblyDocument)
+    If Not NibConfig.EnableDiagnosticLog Then Exit Sub
+    Try
+        Dim Folder As String = If(AssemblyDoc IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(AssemblyDoc.FullFileName), _
+                                  System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName), _
+                                  System.IO.Path.GetTempPath())
+        Dim BaseName As String = If(AssemblyDoc IsNot Nothing, _
+                                    System.IO.Path.GetFileNameWithoutExtension(AssemblyDoc.FullFileName), _
+                                    "NibAutomation")
+        Dim LogPath As String = System.IO.Path.Combine(Folder, BaseName & "_NibLog_" & DateTime.Now.ToString("yyyyMMdd_HHmmss") & ".log")
+        System.IO.File.WriteAllText(LogPath, Logger.GetText())
+    Catch
+    End Try
+End Sub
 
 Class Logger
-
-
-    Private Shared LogLines As _
-        New System.Collections.Generic.List(Of String)
-
-
-    ' --------------------------------------------------------
-    ' START
-    ' --------------------------------------------------------
+    Private Shared Lines As New System.Collections.Generic.List(Of String)
 
     Public Shared Sub Start()
-
-
-        LogLines.Clear()
-
-
-        WriteLine( _
-            "============================================================")
-
-
-        WriteLine( _
-            "INVENTOR NIB AUTOMATION LOG")
-
-
-        WriteLine( _
-            "Started: " & _
-            DateTime.Now.ToString( _
-                "yyyy-MM-dd HH:mm:ss"))
-
-
-        WriteLine( _
-            "============================================================")
-
-
+        Lines.Clear()
+        WriteRaw("INVENTOR NIB AUTOMATION LOG - " & DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"))
     End Sub
 
-
-    ' --------------------------------------------------------
-    ' INFO
-    ' --------------------------------------------------------
-
-    Public Shared Sub Info( _
-        Message As String)
-
-
-        WriteLine( _
-            "[INFO]    " & _
-            Message)
-
-
+    Public Shared Sub Section(Title As String)
+        If Not NibConfig.EnableDiagnosticLog Then Exit Sub
+        WriteRaw(vbCrLf & "--- " & Title & " ---")
     End Sub
 
+	Public Shared Sub Info(Msg As String)
+	    Log("INFO", Msg)
+	End Sub
+	
+	Public Shared Sub Success(Msg As String)
+	    Log("SUCCESS", Msg)
+	End Sub
+	
+	Public Shared Sub Warning(Msg As String)
+	    Log("WARNING", Msg)
+	End Sub
+	
+	Public Shared Sub [Error](Msg As String)
+	    Log("ERROR", Msg)
+	End Sub
+	
+	Public Shared Sub Debug(Msg As String)
+	    Log("DEBUG", Msg)
+	End Sub
 
-    ' --------------------------------------------------------
-    ' SUCCESS
-    ' --------------------------------------------------------
-
-    Public Shared Sub Success( _
-        Message As String)
-
-
-        WriteLine( _
-            "[SUCCESS] " & _
-            Message)
-
-
+    Private Shared Sub Log(Level As String, Msg As String)
+        If Not NibConfig.EnableDiagnosticLog Then Exit Sub
+        Lines.Add(String.Format("[{0}] {1,-9} {2}", DateTime.Now.ToString("HH:mm:ss"), "[" & Level & "]", Msg))
     End Sub
 
-
-    ' --------------------------------------------------------
-    ' WARNING
-    ' --------------------------------------------------------
-
-    Public Shared Sub Warning( _
-        Message As String)
-
-
-        WriteLine( _
-            "[WARNING] " & _
-            Message)
-
-
+    Private Shared Sub WriteRaw(Text As String)
+        If NibConfig.EnableDiagnosticLog Then Lines.Add(Text)
     End Sub
-
-
-    ' --------------------------------------------------------
-    ' ERROR
-    ' --------------------------------------------------------
-
-    Public Shared Sub [Error]( _
-        Message As String)
-
-
-        WriteLine( _
-            "[ERROR]   " & _
-            Message)
-
-
-    End Sub
-
-
-    ' --------------------------------------------------------
-    ' DEBUG
-    ' --------------------------------------------------------
-
-    Public Shared Sub Debug( _
-        Message As String)
-
-
-        WriteLine( _
-            "[DEBUG]   " & _
-            Message)
-
-
-    End Sub
-
-
-    ' --------------------------------------------------------
-    ' SECTION
-    ' --------------------------------------------------------
-
-    Public Shared Sub Section( _
-        Name As String)
-
-
-        WriteLine("")
-
-
-        WriteLine( _
-            "------------------------------------------------------------")
-
-
-        WriteLine( _
-            Name)
-
-
-        WriteLine( _
-            "------------------------------------------------------------")
-
-
-    End Sub
-
-
-    ' --------------------------------------------------------
-    ' INTERNAL WRITE METHOD
-    ' --------------------------------------------------------
-
-    Private Shared Sub WriteLine( _
-        Message As String)
-
-
-        Dim TimeStamp As String = _
-            DateTime.Now.ToString("HH:mm:ss")
-
-
-        ' --------------------------------------------------------
-        ' ALIGN LOG MESSAGE CONTENT
-        '
-        ' Keep the severity labels in a fixed-width column so that
-        ' the actual log message always starts at the same position.
-        '
-        ' Three spaces are added after the longest severity label
-        ' ([SUCCESS] / [WARNING]) to give the log a little more
-        ' separation between the identifier and the message.
-        ' --------------------------------------------------------
-
-        Dim FormattedMessage As String = Message
-
-
-		If Message.StartsWith("[INFO]") Then
-		
-		    FormattedMessage = _
-		        "[INFO]" & _
-		        Message.Substring(6).TrimStart().PadLeft( _
-		            Message.Substring(6).TrimStart().Length + 11)
-		
-		
-		ElseIf Message.StartsWith("[SUCCESS]") Then
-		
-		    FormattedMessage = _
-		        "[SUCCESS]" & _
-		        Message.Substring(9).TrimStart().PadLeft( _
-		            Message.Substring(9).TrimStart().Length + 5)
-		
-		
-		ElseIf Message.StartsWith("[WARNING]") Then
-		
-		    FormattedMessage = _
-		        "[WARNING]" & _
-		        Message.Substring(9).TrimStart().PadLeft( _
-		            Message.Substring(9).TrimStart().Length + 3)
-		
-		
-		ElseIf Message.StartsWith("[ERROR]") Then
-		
-		    FormattedMessage = _
-		        "[ERROR]" & _
-		        Message.Substring(7).TrimStart().PadLeft( _
-		            Message.Substring(7).TrimStart().Length + 10)
-		
-		
-		ElseIf Message.StartsWith("[DEBUG]") Then
-		
-		    FormattedMessage = _
-		        "[DEBUG]" & _
-		        Message.Substring(7).TrimStart().PadLeft( _
-		            Message.Substring(7).TrimStart().Length + 8)
-		
-		End If
-
-
-        LogLines.Add( _
-            "[" & _
-            TimeStamp & _
-            "] " & _
-            FormattedMessage)
-
-
-    End Sub
-
-
-    ' --------------------------------------------------------
-    ' RETURN COMPLETE LOG
-    ' --------------------------------------------------------
 
     Public Shared Function GetText() As String
-
-
-        Return String.Join( _
-            vbCrLf, _
-            LogLines)
-
-
+        Return String.Join(vbCrLf, Lines)
     End Function
-
-
-    ' --------------------------------------------------------
-    ' SAVE LOG TO FILE
-    ' --------------------------------------------------------
-
-    Public Shared Sub SaveToFile( _
-        FilePath As String)
-
-
-        Try
-
-
-            System.IO.File.WriteAllText( _
-                FilePath, _
-                GetText())
-
-
-        Catch ex As Exception
-
-
-            MsgBox( _
-                "Unable to save log file:" & _
-                vbCrLf & _
-                ex.Message)
-
-
-        End Try
-
-
-    End Sub
-
-
 End Class
