@@ -3,38 +3,48 @@
 '
 ' Assembly / Plate Scanner + Nib Edge Analysis + Transient Solid B-rep Transfer and Combine
 '
-' Version: 0.5.2.4
-'   - Adds temporary, real assembly nib source occurrences before plate processing
-'   - Retains those occurrences if any target plate fails or is skipped
-'   - Removes staging occurrences only after their corresponding plate processing succeeds
+' Version: 0.6.0
+'   - Extends edge detection and nib placement from straight segments to planar curved edges
+'     (circular arcs, full circles, elliptical arcs, ellipses, and B-splines) via CurveEvaluator[cite: 1]
+'   - Evaluates true arc lengths, equal arc-length intervals, and instantaneous curve tangents
+'     so nibs rotate smoothly along curved boundaries to remain normal to the cut edge[cite: 1]
+'   - Handles closed loops (e.g., full circles and closed splines) with zero end clearance and
+'     non-overlapping full-perimeter distribution
+'   - Determines outward projection vectors via local surface-probing rather than loop centroids,
+'     ensuring accurate outward orientation on both convex and concave curves[cite: 1]
+'   - Uses SurfaceEvaluator topological outward face normals to guarantee nibs remain centred on
+'     the plate mid-plane regardless of underlying plane normal orientation[cite: 1]
+'   - Adds temporary, real assembly nib source occurrences before plate processing[cite: 1]
+'   - Retains those occurrences if any target plate fails or is skipped[cite: 1]
+'   - Removes staging occurrences only after their corresponding plate processing succeeds[cite: 1]
 '
 ' Purpose:
-'   - Scan the active Inventor assembly
-'   - Recursively scan subassemblies
-'   - Validate assembly naming
-'   - Validate part naming
-'   - Identify PL components
-'   - Identify sheet metal parts
-'   - Measure physical plate thickness from geometry
-'   - Warn only if sheet-metal parameter thickness differs
-'   - Analyse internal openings and/or external boundaries using a selected profile
-'   - Use independent internal-opening and external-perimeter clearances / usable lengths
-'   - Calculate assembly-space candidate positions and display temporary client-graphics markers
-'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part
-'   - Apply a 90-degree roll correction about the nib local +Y projection axis
-'   - Generate repeated copies of the nib solid in each eligible plate part
-'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates
-'   - Join each nib solid to the plate using CombineFeatures (Join operation)
-'   - Report solid-body and existing flat-pattern status for user review
-'   - Reject edges with insufficient usable length or nib separation
-'   - Produce a centralised diagnostic log
+'   - Scan the active Inventor assembly[cite: 1]
+'   - Recursively scan subassemblies[cite: 1]
+'   - Validate assembly naming[cite: 1]
+'   - Validate part naming[cite: 1]
+'   - Identify PL components[cite: 1]
+'   - Identify sheet metal parts[cite: 1]
+'   - Measure physical plate thickness from geometry[cite: 1]
+'   - Warn only if sheet-metal parameter thickness differs[cite: 1]
+'   - Analyse internal openings and/or external boundaries (straight and curved) using a selected profile[cite: 1]
+'   - Use independent internal-opening and external-perimeter clearances / usable lengths[cite: 1]
+'   - Calculate assembly-space candidate positions and display temporary client-graphics markers[cite: 1]
+'   - Calculate a local placement frame for the supplied 3mm-STD-NIB reference part[cite: 1]
+'   - Apply a 90-degree roll correction about the nib local +Y projection axis[cite: 1]
+'   - Generate repeated copies of the nib solid in each eligible plate part[cite: 1]
+'   - Transfer nib solids from temporary assembly occurrences using transient solid B-rep copies transformed into plate-local coordinates[cite: 1]
+'   - Join each nib solid to the plate using CombineFeatures (Join operation)[cite: 1]
+'   - Report solid-body and existing flat-pattern status for user review[cite: 1]
+'   - Reject edges with insufficient usable length or nib separation[cite: 1]
+'   - Produce a centralised diagnostic log[cite: 1]
 '
-' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.
-' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,
-' inserted as non-associative solid base features, then joined with CombineFeatures.
-' It does NOT automatically save any documents. Review each modified plate and save manually.
-' If a plate operation fails, its Inventor transaction is aborted where possible.
-' This is the first geometry-generation build; verify the resulting sheet-metal flat pattern in Inventor.
+' IMPORTANT: This version modifies eligible plate part documents in memory after explicit confirmation.[cite: 1]
+' Nib bodies are copied from the reference solid as transient B-rep bodies, transformed into plate-local coordinates,[cite: 1]
+' inserted as non-associative solid base features, then joined with CombineFeatures.[cite: 1]
+' It does NOT automatically save any documents. Review each modified plate and save manually.[cite: 1]
+' If a plate operation fails, its Inventor transaction is aborted where possible.[cite: 1]
+' Verify the resulting sheet-metal flat pattern in Inventor before DXF export.[cite: 1]
 '
 ' ============================================================
 
@@ -983,34 +993,37 @@ Sub AnalyzePlateGeometry( _
             Logger.Info("Boundary loop " & LoopsAnalysed & ": " & LoopType & _
                         If(IncludeLoop, " [IN SCOPE]", " [EXCLUDED BY PROFILE]"))
 
-            Dim LongestStraightEdgeMM As Double = 0
+Dim LongestEdgeMM As Double = 0
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
-                Dim ThisLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
-                If ThisLengthMM > LongestStraightEdgeMM Then LongestStraightEdgeMM = ThisLengthMM
+                Dim ThisLengthMM As Double = GetCurveEdgeLengthMM(PartDoc, Edge)
+                If ThisLengthMM > LongestEdgeMM Then LongestEdgeMM = ThisLengthMM
             Next
 
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
                 EdgesAnalysed += 1
 
-                Dim EdgeLengthMM As Double = GetStraightEdgeLengthMM(PartDoc, Edge)
-                Dim IsStraight As Boolean = IsStraightEdge(Edge)
+                Dim EdgeLengthMM As Double = GetCurveEdgeLengthMM(PartDoc, Edge)
+                Dim IsSupportedCurve As Boolean = IsSupportedEdgeCurve(Edge)
+                Dim EdgeTypeLabel As String = GetEdgeCurveTypeName(Edge)
+                Dim IsClosed As Boolean = IsClosedEdgeCurve(Edge)
                 Dim AlignmentWithNormal As Double = -1.0
                 Dim OrientationClass As String = ClassifyEdgeAgainstFaceNormal( _
                     MainFace, Edge, OrientationToleranceDegrees, AlignmentWithNormal)
 
-                ' Thickness is retained as a secondary validation only. The primary
-                ' orientation decision comes from the edge/face-normal vector comparison.
                 Dim IsThicknessScaleEdge As Boolean = False
-                If PhysicalThicknessMM > 0 AndAlso IsStraight Then
+                If PhysicalThicknessMM > 0 AndAlso IsSupportedCurve Then
                     IsThicknessScaleEdge = (EdgeLengthMM <= PhysicalThicknessMM * 1.5)
                 End If
+
+                Dim AppliedEndClearanceMM As Double = If(IsClosed, 0.0, If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM))
+                Dim AppliedMinUsableMM As Double = If(IsOuterLoop, ExternalMinimumUsableLengthMM, InternalMinimumUsableLengthMM)
 
                 Dim IsCandidate As Boolean = IncludeLoop
                 Dim Reason As String = "Boundary permitted by selected profile"
 
-                If Not IsStraight Then
+                If Not IsSupportedCurve Then
                     IsCandidate = False
-                    Reason = "Curved edge not supported by initial analyser"
+                    Reason = "Unsupported edge geometry type (" & EdgeTypeLabel & ")"
                 ElseIf OrientationClass = "THICKNESS-DIRECTION" Then
                     IsCandidate = False
                     Reason = "Edge direction is parallel to the plate normal"
@@ -1026,21 +1039,20 @@ Sub AnalyzePlateGeometry( _
                 ElseIf EdgeLengthMM < MinimumNibEdgeLengthMM Then
                     IsCandidate = False
                     Reason = "Below minimum edge length"
-                ElseIf EdgeLengthMM <= (2 * If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM)) Then
+                ElseIf EdgeLengthMM <= (2 * AppliedEndClearanceMM) Then
                     IsCandidate = False
                     Reason = "Insufficient length after boundary-specific end clearances"
-                ElseIf (EdgeLengthMM - (2 * If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM))) < _
-                       If(IsOuterLoop, ExternalMinimumUsableLengthMM, InternalMinimumUsableLengthMM) Then
+                ElseIf (EdgeLengthMM - (2 * AppliedEndClearanceMM)) < AppliedMinUsableMM Then
                     IsCandidate = False
                     Reason = "Usable length after boundary-specific end clearances is below the configured minimum"
                 ElseIf NibProfile = "Internal openings - long edges only" AndAlso _
-                       EdgeLengthMM < (LongestStraightEdgeMM * 0.75) Then
+                       EdgeLengthMM < (LongestEdgeMM * 0.75) Then
                     IsCandidate = False
                     Reason = "Not a long side under the selected profile heuristic"
                 End If
 
                 Logger.Info("Edge " & EdgesAnalysed & _
-                            " | Type=" & If(IsStraight, "Straight", "Curved/other") & _
+                            " | Type=" & EdgeTypeLabel & If(IsClosed, " (Closed)", "") & _
                             " | Length=" & Math.Round(EdgeLengthMM, 2) & " mm" & _
                             " | Orientation=" & OrientationClass & _
                             " | Abs(dot)=" & If(AlignmentWithNormal >= 0, Math.Round(AlignmentWithNormal, 6).ToString(), "N/A") & _
@@ -1049,13 +1061,10 @@ Sub AnalyzePlateGeometry( _
                             " | " & Reason)
 
                 If IsCandidate Then
-                    Dim EdgeEndClearanceMM As Double = If(IsOuterLoop, ExternalEndClearanceMM, InternalEndClearanceMM)
-                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * EdgeEndClearanceMM)
+                    Dim UsableLengthMM As Double = EdgeLengthMM - (2 * AppliedEndClearanceMM)
 
-                    ' Divide the usable span into equal centre-to-centre intervals.
-                    ' The first and last nib centres sit exactly at the configured
-                    ' end clearances. The interval count must satisfy both bounds.
                     Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / MaximumNibSpacingMM))
+                    If IsClosed AndAlso IntervalCount < 2 Then IntervalCount = 2
                     If IntervalCount < 1 Then IntervalCount = 1
                     Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
 
@@ -1068,28 +1077,29 @@ Sub AnalyzePlateGeometry( _
                     Else
                         CandidateEdges += 1
                         Logger.Info("  Candidate positions from edge start (mm):")
-                        Dim StartVertex As Inventor.Vertex = Edge.StartVertex
-                        Dim StopVertex As Inventor.Vertex = Edge.StopVertex
-                        If StartVertex Is Nothing OrElse StopVertex Is Nothing Then
-                            Logger.Warning("  Candidate positions retained in report only; edge vertices unavailable for visual marker coordinates.")
-                        End If
-                        For PositionIndex As Integer = 0 To IntervalCount
-                            Dim PositionMM As Double = EdgeEndClearanceMM + (PositionIndex * ActualSpacingMM)
+
+                        ' On closed curves (e.g., full circles), stop at IntervalCount - 1 so
+                        ' the final nib doesn't overlap the first nib at 0 mm.
+                        Dim MaxIndex As Integer = If(IsClosed, IntervalCount - 1, IntervalCount)
+
+                        For PositionIndex As Integer = 0 To MaxIndex
+                            Dim PositionMM As Double = AppliedEndClearanceMM + (PositionIndex * ActualSpacingMM)
                             Logger.Info("    " & Math.Round(PositionMM, 2) & " mm")
                             CandidatePositions += 1
-                            If StartVertex IsNot Nothing AndAlso StopVertex IsNot Nothing Then
-                                AddCandidateMarkerCoordinate(PartDoc, StartVertex.Point, StopVertex.Point, _
-                                    PositionMM, EdgeLengthMM, OccurrenceTransform, IsOuterLoop, _
-                                    InternalMarkerCoordinates, ExternalMarkerCoordinates)
-                                AddNibPreviewPlacement(PartDoc, MainFace, BoundaryLoop, Edge, _
-                                    PositionMM, EdgeLengthMM, PhysicalThicknessMM, OccurrenceTransform, _
-                                    TargetOccurrenceContext, NibPreviewPlacements, NibPartPlacements)
-                            End If
+
+                            AddCandidateMarkerCoordinate(PartDoc, Edge, _
+                                PositionMM, OccurrenceTransform, IsOuterLoop, _
+                                InternalMarkerCoordinates, ExternalMarkerCoordinates)
+
+                            AddNibPreviewPlacement(PartDoc, MainFace, BoundaryLoop, Edge, _
+                                PositionMM, PhysicalThicknessMM, OccurrenceTransform, _
+                                TargetOccurrenceContext, NibPreviewPlacements, NibPartPlacements)
                         Next
+
                         Logger.Info("  Boundary type: " & LoopType)
-                        Logger.Info("  Applied end clearance: " & EdgeEndClearanceMM & " mm")
+                        Logger.Info("  Applied end clearance: " & AppliedEndClearanceMM & " mm")
                         Logger.Info("  Usable length: " & Math.Round(UsableLengthMM, 2) & " mm")
-                        Logger.Info("  Nib centre count: " & (IntervalCount + 1))
+                        Logger.Info("  Nib centre count: " & (MaxIndex + 1))
                         Logger.Info("  Actual centre-to-centre spacing: " & Math.Round(ActualSpacingMM, 2) & _
                                     " mm; permitted range: " & MinimumNibCentreSeparationMM & " to " & _
                                     MaximumNibSpacingMM & " mm")
@@ -1146,7 +1156,6 @@ Sub AddNibPreviewPlacement( _
     BoundaryLoop As Inventor.EdgeLoop, _
     Edge As Inventor.Edge, _
     DistanceAlongEdgeMM As Double, _
-    EdgeLengthMM As Double, _
     PhysicalThicknessMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
     TargetOccurrenceContext As Object, _
@@ -1155,62 +1164,47 @@ Sub AddNibPreviewPlacement( _
 
     Try
         If PartDoc Is Nothing OrElse BroadFace Is Nothing OrElse BoundaryLoop Is Nothing OrElse Edge Is Nothing Then Exit Sub
-        If EdgeLengthMM <= 0 OrElse PhysicalThicknessMM <= 0 Then Exit Sub
-        If Not IsStraightEdge(Edge) Then Exit Sub
-        If Edge.StartVertex Is Nothing OrElse Edge.StopVertex Is Nothing Then Exit Sub
+        If PhysicalThicknessMM <= 0 Then Exit Sub
+        If Not IsSupportedEdgeCurve(Edge) Then Exit Sub
 
-        Dim Fraction As Double = DistanceAlongEdgeMM / EdgeLengthMM
-        If Fraction < 0 OrElse Fraction > 1 Then Exit Sub
-
-        Dim P0 As Inventor.Point = Edge.StartVertex.Point
-        Dim P1 As Inventor.Point = Edge.StopVertex.Point
-        Dim EdgePoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
-            P0.X + ((P1.X - P0.X) * Fraction), _
-            P0.Y + ((P1.Y - P0.Y) * Fraction), _
-            P0.Z + ((P1.Z - P0.Z) * Fraction))
+        ' Evaluate exact 3D point and unit tangent along any curve (line, arc, circle, ellipse, spline)
+        Dim EdgePoint As Inventor.Point = Nothing
+        Dim Tangent As Inventor.Vector = Nothing
+        If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, EdgePoint, Tangent) Then Exit Sub
 
         Dim FacePlane As Inventor.Plane = CType(BroadFace.Geometry, Inventor.Plane)
-        Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+        Dim FaceNormal As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             FacePlane.Normal.X, FacePlane.Normal.Y, FacePlane.Normal.Z)
-        ZAxis.Normalize()
+        FaceNormal.Normalize()
 
-        Dim EdgeLine As Inventor.LineSegment = CType(Edge.Geometry, Inventor.LineSegment)
-        Dim Tangent As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
-            EdgeLine.Direction.X, EdgeLine.Direction.Y, EdgeLine.Direction.Z)
-        Tangent.Normalize()
+        ' Compute the two candidate in-plane vectors perpendicular to the curve tangent
+        Dim CandidateOutward As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
+            (Tangent.Y * FaceNormal.Z) - (Tangent.Z * FaceNormal.Y), _
+            (Tangent.Z * FaceNormal.X) - (Tangent.X * FaceNormal.Z), _
+            (Tangent.X * FaceNormal.Y) - (Tangent.Y * FaceNormal.X))
+        If CandidateOutward.Length < 0.000001 Then Exit Sub
+        CandidateOutward.Normalize()
 
-        ' Determine the direction away from plate material. For external loops,
-        ' use the vector from the broad-face interior towards the edge. For an
-        ' internal opening, use the vector from the edge towards that opening's loop centre.
-        Dim LoopCentre As Inventor.Point = GetBoundaryLoopCentre(BoundaryLoop)
-        Dim DesiredOutward As Inventor.Vector = Nothing
-        If BoundaryLoop.IsOuterEdgeLoop Then
-            ' The centroid of the outer boundary is used as a stable interior reference
-            ' for the common convex plate outlines handled by this first preview build.
-            Dim FaceInterior As Inventor.Point = LoopCentre
-            DesiredOutward = ThisApplication.TransientGeometry.CreateVector( _
-                EdgePoint.X - FaceInterior.X, EdgePoint.Y - FaceInterior.Y, EdgePoint.Z - FaceInterior.Z)
-        Else
-            DesiredOutward = ThisApplication.TransientGeometry.CreateVector( _
-                LoopCentre.X - EdgePoint.X, LoopCentre.Y - EdgePoint.Y, LoopCentre.Z - EdgePoint.Z)
+        ' Test a tiny 0.05 cm (0.5 mm) step along CandidateOutward.
+        ' If that test point lands ON the solid face material, flip the vector so it points OUTWARD.
+        Dim ProbeDistCM As Double = 0.05
+        Dim ProbePoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
+            EdgePoint.X + (CandidateOutward.X * ProbeDistCM), _
+            EdgePoint.Y + (CandidateOutward.Y * ProbeDistCM), _
+            EdgePoint.Z + (CandidateOutward.Z * ProbeDistCM))
+
+        Dim ClosestOnFace As Inventor.Point = BroadFace.GetClosestPointTo(ProbePoint)
+        Dim DistToFaceCM As Double = ProbePoint.DistanceTo(ClosestOnFace)
+
+        ' If the probe point is essentially on the broad face (distance < 0.01 cm), it stepped INTO the metal
+        If DistToFaceCM < 0.01 Then
+            CandidateOutward.ScaleBy(-1.0)
         End If
 
-        ' Remove any component parallel to the edge, then normalise.
-        Dim Along As Double = DesiredOutward.DotProduct(Tangent)
-        DesiredOutward.X = DesiredOutward.X - (Along * Tangent.X)
-        DesiredOutward.Y = DesiredOutward.Y - (Along * Tangent.Y)
-        DesiredOutward.Z = DesiredOutward.Z - (Along * Tangent.Z)
-        If DesiredOutward.Length < 0.000001 Then Exit Sub
-        DesiredOutward.Normalize()
+        Dim YAxis As Inventor.Vector = CandidateOutward
+        Dim ZAxis As Inventor.Vector = FaceNormal.Copy()
 
-        ' Initial right-handed frame: local +Y points outwards from the plate.
-        ' The first preview showed the nib profile rolled 90 degrees relative
-        ' to the plate. Correct this by rolling the nib 90 degrees about its
-        ' own +Y projection axis. This keeps the ZX attachment plane normal
-        ' aligned with the outward direction while swapping the two in-plane
-        ' axes. The resulting local +X follows the broad-face normal and local
-        ' +Z follows the plate-edge direction (with sign set for a right-handed frame).
-        Dim YAxis As Inventor.Vector = DesiredOutward
+        ' Initial right-handed frame before 90-degree roll about +Y
         Dim InitialXAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             (YAxis.Y * ZAxis.Z) - (YAxis.Z * ZAxis.Y), _
             (YAxis.Z * ZAxis.X) - (YAxis.X * ZAxis.Z), _
@@ -1218,7 +1212,7 @@ Sub AddNibPreviewPlacement( _
         If InitialXAxis.Length < 0.000001 Then Exit Sub
         InitialXAxis.Normalize()
 
-        ' 90-degree roll about local +Y: X(new)=Z(old), Z(new)=-X(old).
+        ' 90-degree roll about local +Y: X(new)=Z(old), Z(new)=-X(old)
         Dim XAxis As Inventor.Vector = ZAxis.Copy()
         Dim CorrectedZAxis As Inventor.Vector = InitialXAxis.Copy()
         CorrectedZAxis.ScaleBy(-1.0)
@@ -1226,11 +1220,7 @@ Sub AddNibPreviewPlacement( _
         XAxis.Normalize()
         ZAxis.Normalize()
 
-        ' After the 90-degree roll, local +X is aligned with the selected
-        ' broad-face normal. Move half the measured physical thickness inward
-        ' along that broad-face normal so the nib remains centred across the
-        ' plate's thin edge. Do not use local Z here: local Z now follows the
-        ' plate-edge direction.
+        ' Centre nib across the plate's physical thickness along the broad-face normal
         Dim HalfThicknessCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits( _
             PhysicalThicknessMM / 2.0, "mm", "cm")
         Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
@@ -1238,10 +1228,7 @@ Sub AddNibPreviewPlacement( _
             EdgePoint.Y - (XAxis.Y * HalfThicknessCM), _
             EdgePoint.Z - (XAxis.Z * HalfThicknessCM))
 
-        ' Store a second frame in the plate part's own coordinates. This is
-        ' essential because the geometry will be generated inside the IPT,
-        ' not as a separate assembly occurrence.
-        ' Transform origin and axis endpoints into assembly coordinates.
+        ' Transform origin and basis vectors into assembly coordinates
         Dim O As Inventor.Point = OriginPart.Copy()
         O.TransformBy(OccurrenceTransform)
         Dim XP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
@@ -1259,11 +1246,8 @@ Sub AddNibPreviewPlacement( _
         Dim AZ As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(ZP.X - O.X, ZP.Y - O.Y, ZP.Z - O.Z)
         AX.Normalize() : AY.Normalize() : AZ.Normalize()
 
-        ' Store origin followed by the X, Y and Z basis vectors (assembly coordinates).
         Placements.Add(New Double() {O.X, O.Y, O.Z, AX.X, AX.Y, AX.Z, AY.X, AY.Y, AY.Z, AZ.X, AZ.Y, AZ.Z})
 
-        ' Append the paired plate-local record only after the assembly-space
-        ' record has been successfully calculated. This keeps both arrays aligned.
         Dim StagingOccurrenceIndex As Integer = Placements.Count - 1
         PartPlacements.Add(New Object() { _
             PartDoc.FullFileName, _
@@ -1862,28 +1846,20 @@ End Function
 
 Sub AddCandidateMarkerCoordinate( _
     PartDoc As Inventor.PartDocument, _
-    StartPoint As Inventor.Point, _
-    EndPoint As Inventor.Point, _
+    Edge As Inventor.Edge, _
     DistanceAlongEdgeMM As Double, _
-    EdgeLengthMM As Double, _
     OccurrenceTransform As Inventor.Matrix, _
     IsExternal As Boolean, _
     InternalCoordinates As System.Collections.ArrayList, _
     ExternalCoordinates As System.Collections.ArrayList)
 
     Try
-        If PartDoc Is Nothing OrElse StartPoint Is Nothing OrElse EndPoint Is Nothing Then Exit Sub
-        If EdgeLengthMM <= 0 Then Exit Sub
+        If PartDoc Is Nothing OrElse Edge Is Nothing Then Exit Sub
 
-        Dim Fraction As Double = DistanceAlongEdgeMM / EdgeLengthMM
-        If Fraction < 0 OrElse Fraction > 1 Then Exit Sub
+        Dim MarkerPoint As Inventor.Point = Nothing
+        Dim DummyTangent As Inventor.Vector = Nothing
+        If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, MarkerPoint, DummyTangent) Then Exit Sub
 
-        ' Inventor database coordinates are centimetres. Interpolate in part
-        ' coordinates, then transform into the active assembly coordinate frame.
-        Dim X As Double = StartPoint.X + ((EndPoint.X - StartPoint.X) * Fraction)
-        Dim Y As Double = StartPoint.Y + ((EndPoint.Y - StartPoint.Y) * Fraction)
-        Dim Z As Double = StartPoint.Z + ((EndPoint.Z - StartPoint.Z) * Fraction)
-        Dim MarkerPoint As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(X, Y, Z)
         MarkerPoint.TransformBy(OccurrenceTransform)
 
         Dim Target As System.Collections.ArrayList = If(IsExternal, ExternalCoordinates, InternalCoordinates)
@@ -1894,7 +1870,6 @@ Sub AddCandidateMarkerCoordinate( _
         Logger.Debug("Unable to calculate assembly-space marker coordinate: " & ex.Message)
     End Try
 End Sub
-
 
 Sub DrawNibCandidateMarkers( _
     AssemblyDoc As Inventor.AssemblyDocument, _
@@ -1997,26 +1972,38 @@ Function ClassifyEdgeAgainstFaceNormal( _
     If Face Is Nothing OrElse Edge Is Nothing Then Return "UNAVAILABLE"
 
     Try
-        If Not IsStraightEdge(Edge) Then Return "UNAVAILABLE"
+        If Not IsSupportedEdgeCurve(Edge) Then Return "UNAVAILABLE"
 
         Dim PlaneGeometry As Inventor.Plane = CType(Face.Geometry, Inventor.Plane)
         Dim FaceNormal As Inventor.UnitVector = PlaneGeometry.Normal
-        Dim LineGeometry As Inventor.LineSegment = CType(Edge.Geometry, Inventor.LineSegment)
-        Dim EdgeDirection As Inventor.UnitVector = LineGeometry.Direction
 
-        ' UnitVector components are already normalised. Use the absolute dot
-        ' product so reversed edge/face directions classify identically.
-        Dim DotValue As Double = _
-            (FaceNormal.X * EdgeDirection.X) + _
-            (FaceNormal.Y * EdgeDirection.Y) + _
-            (FaceNormal.Z * EdgeDirection.Z)
-
-        AbsoluteDotProduct = Math.Abs(DotValue)
-        If AbsoluteDotProduct > 1.0 Then AbsoluteDotProduct = 1.0
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinParam As Double = 0, MaxParam As Double = 0
+        Eval.GetParamExtents(MinParam, MaxParam)
 
         Dim ToleranceRadians As Double = ToleranceDegrees * Math.PI / 180.0
         Dim InPlaneLimit As Double = Math.Sin(ToleranceRadians)
         Dim ThicknessLimit As Double = Math.Cos(ToleranceRadians)
+
+        ' Sample start, mid, and end tangents so 3D splines that leave the plane are caught
+        Dim SampleFractions() As Double = {0.1, 0.5, 0.9}
+        Dim MaxDot As Double = 0.0
+
+        For Each F As Double In SampleFractions
+            Dim Params(0) As Double
+            Params(0) = MinParam + ((MaxParam - MinParam) * F)
+            Dim Tangents() As Double = {}
+            Eval.GetTangent(Params, Tangents)
+
+            Dim Tx As Double = Tangents(0), Ty As Double = Tangents(1), Tz As Double = Tangents(2)
+            Dim Mag As Double = Math.Sqrt((Tx * Tx) + (Ty * Ty) + (Tz * Tz))
+            If Mag < 0.000001 Then Return "UNAVAILABLE"
+
+            Dim DotValue As Double = Math.Abs(((FaceNormal.X * Tx) + (FaceNormal.Y * Ty) + (FaceNormal.Z * Tz)) / Mag)
+            If DotValue > MaxDot Then MaxDot = DotValue
+        Next
+
+        AbsoluteDotProduct = Math.Min(MaxDot, 1.0)
 
         If AbsoluteDotProduct <= InPlaneLimit Then
             Return "IN-PLANE"
@@ -2044,8 +2031,8 @@ Function CountLongBoundaryEdges( _
     Try
         For Each BoundaryLoop As Inventor.EdgeLoop In Face.EdgeLoops
             For Each Edge As Inventor.Edge In BoundaryLoop.Edges
-                If IsStraightEdge(Edge) Then
-                    If GetStraightEdgeLengthMM(PartDoc, Edge) > MinimumLongEdgeLengthMM Then
+                If IsSupportedEdgeCurve(Edge) Then
+                    If GetCurveEdgeLengthMM(PartDoc, Edge) > MinimumLongEdgeLengthMM Then
                         Count += 1
                     End If
                 End If
@@ -2099,8 +2086,138 @@ End Function
 
 
 ' ------------------------------------------------------------
-' EDGE GEOMETRY HELPERS
+' EDGE GEOMETRY HELPERS (LINES, ARCS, CIRCLES, ELLIPSES, SPLINES)
 ' ------------------------------------------------------------
+
+Function IsSupportedEdgeCurve(Edge As Inventor.Edge) As Boolean
+    If Edge Is Nothing Then Return False
+
+    Try
+        Select Case Edge.GeometryType
+            Case Inventor.CurveTypeEnum.kLineSegmentCurve, _
+                 Inventor.CurveTypeEnum.kCircularArcCurve, _
+                 Inventor.CurveTypeEnum.kCircleCurve, _
+                 Inventor.CurveTypeEnum.kEllipticalArcCurve, _
+                 Inventor.CurveTypeEnum.kEllipseFullCurve, _
+                 Inventor.CurveTypeEnum.kBSplineCurve
+                Return True
+            Case Else
+                Return False
+        End Select
+    Catch
+        Return False
+    End Try
+End Function
+
+
+Function GetEdgeCurveTypeName(Edge As Inventor.Edge) As String
+    If Edge Is Nothing Then Return "Unknown"
+    Try
+        Select Case Edge.GeometryType
+            Case Inventor.CurveTypeEnum.kLineSegmentCurve : Return "Straight"
+            Case Inventor.CurveTypeEnum.kCircularArcCurve : Return "Circular Arc"
+            Case Inventor.CurveTypeEnum.kCircleCurve : Return "Circle"
+            Case Inventor.CurveTypeEnum.kEllipticalArcCurve : Return "Elliptical Arc"
+            Case Inventor.CurveTypeEnum.kEllipseFullCurve : Return "Ellipse"
+            Case Inventor.CurveTypeEnum.kBSplineCurve : Return "Spline"
+            Case Else : Return Edge.GeometryType.ToString()
+        End Select
+    Catch
+        Return "Unknown"
+    End Try
+End Function
+
+
+Function IsClosedEdgeCurve(Edge As Inventor.Edge) As Boolean
+    If Edge Is Nothing Then Return False
+    Try
+        If Edge.GeometryType = Inventor.CurveTypeEnum.kCircleCurve OrElse _
+           Edge.GeometryType = Inventor.CurveTypeEnum.kEllipseFullCurve Then
+            Return True
+        End If
+
+        ' Also catch closed B-splines or arcs where start and end points coincide
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinParam As Double = 0, MaxParam As Double = 0
+        Eval.GetParamExtents(MinParam, MaxParam)
+
+        Dim Params() As Double = {MinParam, MaxParam}
+        Dim Pts() As Double = {}
+        Eval.GetPointAtParam(Params, Pts)
+
+        Dim Dx As Double = Pts(3) - Pts(0)
+        Dim Dy As Double = Pts(4) - Pts(1)
+        Dim Dz As Double = Pts(5) - Pts(2)
+        Return Math.Sqrt((Dx * Dx) + (Dy * Dy) + (Dz * Dz)) < 0.0001
+    Catch
+        Return False
+    End Try
+End Function
+
+
+Function GetCurveEdgeLengthMM( _
+    PartDoc As Inventor.PartDocument, _
+    Edge As Inventor.Edge) As Double
+
+    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return 0
+
+    Try
+        If Not IsSupportedEdgeCurve(Edge) Then Return 0
+
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinParam As Double = 0, MaxParam As Double = 0
+        Eval.GetParamExtents(MinParam, MaxParam)
+
+        Dim LengthCM As Double = 0
+        Eval.GetLengthAtParam(MinParam, MaxParam, LengthCM)
+
+        Return PartDoc.UnitsOfMeasure.ConvertUnits(LengthCM, "cm", "mm")
+    Catch
+        Return 0
+    End Try
+End Function
+
+
+Function TryEvaluateEdgeAtDistanceMM( _
+    PartDoc As Inventor.PartDocument, _
+    Edge As Inventor.Edge, _
+    DistanceAlongEdgeMM As Double, _
+    ByRef OutPoint As Inventor.Point, _
+    ByRef OutTangent As Inventor.Vector) As Boolean
+
+    OutPoint = Nothing
+    OutTangent = Nothing
+    If PartDoc Is Nothing OrElse Edge Is Nothing Then Return False
+
+    Try
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinParam As Double = 0, MaxParam As Double = 0
+        Eval.GetParamExtents(MinParam, MaxParam)
+
+        Dim DistanceCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits(DistanceAlongEdgeMM, "mm", "cm")
+        Dim TargetParam As Double = MinParam
+
+        If DistanceCM > 0 Then
+            Eval.GetParamAtLength(MinParam, DistanceCM, TargetParam)
+        End If
+
+        Dim Params() As Double = {TargetParam}
+        Dim Pts() As Double = {}
+        Dim Tangents() As Double = {}
+
+        Eval.GetPointAtParam(Params, Pts)
+        Eval.GetTangent(Params, Tangents)
+
+        OutPoint = ThisApplication.TransientGeometry.CreatePoint(Pts(0), Pts(1), Pts(2))
+        OutTangent = ThisApplication.TransientGeometry.CreateVector(Tangents(0), Tangents(1), Tangents(2))
+        If OutTangent.Length < 0.000001 Then Return False
+        OutTangent.Normalize()
+
+        Return True
+    Catch
+        Return False
+    End Try
+End Function
 
 Function IsStraightEdge(Edge As Inventor.Edge) As Boolean
     If Edge Is Nothing Then Return False
