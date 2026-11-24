@@ -1,4 +1,4 @@
 ' Runs the external rules in exact top-to-bottom order
 iLogicVb.RunExternalRule("INVENTOR ASSEMBLY SCANNER")
 iLogicVb.RunExternalRule("CopyObjectandCombineTest")
-iLogicVb.RunExternalRule("POST-NIB-FILLETING")
+iLogicVb.RunExternalRule("Post-Nib-Filleting")
