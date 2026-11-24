@@ -1,11 +1,9 @@
 Option Explicit On
 ' ============================================================
-' INVENTOR NIB AUTOMATION (v0.7.0 - Streamlined & Configurable)
+' INVENTOR NIB AUTOMATION (v0.7.1 - Optomising for Sharing with ohers)
 '
-' Scans an Inventor assembly for sheet-metal PL plates, analyses
-' straight and curved boundary edges via CurveEvaluator, stages
-' temporary nib occurrences, and joins solid nib bodies into
-' eligible plate parts via TransientBRep + CombineFeatures.
+' It now should be able to take the nib geometry from the server 
+' rather than a local file.
 ' ============================================================
 
 
@@ -20,6 +18,7 @@ Class NibConfig
     ' --- Component & Reference Rules ---
     Public Shared PlateComponentType As String = "PL"
     Public Shared DefaultNibFileName As String = "3mm-STD-NIB.ipt"
+	Public Shared CentralNibFolder As String = "V:\05 Engineering\05-02 CAD\AutoDesk\UCT - Content Centre\01 - USER COMMAND AUTOMATION GEOMETRY"
     Public Shared MaxStagingOccurrences As Integer = 300
 
     ' --- Nibbing Edge & Spacing Rules (mm) ---
@@ -407,13 +406,32 @@ End Sub
 ' STAGING OCCURRENCES & TRANSIENT B-REP SOLID JOIN
 ' ============================================================
 Function ResolveNibReferenceFile(AssemblyDoc As Inventor.AssemblyDocument) As String
+    ' 1. Check the active assembly's local folder first (allows project-specific overrides)
     Try
-        Dim Folder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
-        Dim Expected As String = System.IO.Path.Combine(Folder, NibConfig.DefaultNibFileName)
-        If System.IO.File.Exists(Expected) Then Return Expected
+        If AssemblyDoc IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(AssemblyDoc.FullFileName) Then
+            Dim AsmFolder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
+            Dim LocalPath As String = System.IO.Path.Combine(AsmFolder, NibConfig.DefaultNibFileName)
+            If System.IO.File.Exists(LocalPath) Then
+                Logger.Info("Using local assembly nib reference: " & LocalPath)
+                Return LocalPath
+            End If
+        End If
     Catch
     End Try
 
+    ' 2. Check the central shared network folder automatically (silent team fallback)
+    Try
+        If Not String.IsNullOrWhiteSpace(NibConfig.CentralNibFolder) Then
+            Dim CentralPath As String = System.IO.Path.Combine(NibConfig.CentralNibFolder, NibConfig.DefaultNibFileName)
+            If System.IO.File.Exists(CentralPath) Then
+                Logger.Info("Using central standard nib reference: " & CentralPath)
+                Return CentralPath
+            End If
+        End If
+    Catch
+    End Try
+
+    ' 3. Fallback to manual file picker only if neither location has the file
     Dim Dialog As New System.Windows.Forms.OpenFileDialog With { _
         .Title = "Select the nib reference part", _
         .Filter = "Inventor Part (*.ipt)|*.ipt", _
