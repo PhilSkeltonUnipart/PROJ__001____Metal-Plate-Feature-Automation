@@ -1,32 +1,34 @@
+Option Explicit On
 ' ============================================================
-' INVENTOR AUTOMATED PLATE CORNER FILLETING (v2.0.0 - Geometry-Based)
+' INVENTOR AUTOMATED PLATE CORNER FILLETING (v3.0.0 - SheetMetal + Sculpt Ready)
 '
 ' Purpose:
-'   - Called sequentially by a Master iLogic rule AFTER nibs have
-'     been joined into PL sheet-metal plates.
-'   - Uses adjacent edge lengths + concave corner topology to
-'     distinguish nib-to-plate root junctions from standard plate
-'     corners—works even if feature names change.
-'   - Zero pop-ups; silent file logging controlled via toggle.
+'   - Runs from the active assembly AFTER nibs have been sculpted/joined
+'     into PL sheet-metal plates.
+'   - Ignores leftover surface bodies (e.g., from Sculpt features) and
+'     targets the single solid sheet-metal body.
+'   - Uses SheetMetalFeatures.FilletFeatures so fillets build cleanly
+'     inside the Folded Model tree.
+'   - Distinguishes semi-circular/short nib root junctions from standard
+'     plate corners via edge length & concave topology.
 ' ============================================================
 
-Option Explicit On
 
 ' ============================================================
 ' USER CONFIGURATION & TOGGLES (EDIT RULES HERE)
 ' ============================================================
 Class FilletConfig
     ' --- Diagnostic Toggle (Code-Only, No Pop-Ups) ---
-    Public Shared EnableDiagnosticLog As Boolean = False       ' True = writes .log file next to assembly
+    Public Shared EnableDiagnosticLog As Boolean = True       ' True = writes .log file next to assembly
 
     ' --- Component Filtering ---
     Public Shared PlateComponentType As String = "PL"
     Public Shared SkipIfAlreadyFilleted As Boolean = True      ' Prevents duplicate runs on the same plate
 
-    ' --- Geometric Nib Recognition (Based on Nib Protrusion Length) ---
-    ' At a nib-to-plate root corner, one edge is the short nib side wall (<= MaxNibSideWallLengthMM)
-    ' and the other edge is the plate boundary (>= MinPlateEdgeAdjacentToNibMM).
-    Public Shared MaxNibSideWallLengthMM As Double = 12.0      ' Max length (mm) of the nib's protruding side edge
+    ' --- Geometric Nib Recognition ---
+    ' A nib-to-plate junction is a CONCAVE corner where a short nib edge/arc
+    ' (<= MaxNibEdgeLengthMM) meets a longer plate edge (>= MinPlateEdgeAdjacentToNibMM).
+    Public Shared MaxNibEdgeLengthMM As Double = 15.0          ' Max arc/edge length (mm) of a nib boundary
     Public Shared MinPlateEdgeAdjacentToNibMM As Double = 20.0 ' Min length (mm) of the plate edge next to a nib
 
     ' --- Nib-to-Plate Junction Fillet Rules ---
@@ -34,8 +36,8 @@ Class FilletConfig
     Public Shared NibJunctionFilletRadiusMM As Double = 1.5      ' Radius (mm) for nib-to-plate root corners
 
     ' --- Standard Plate Corner Fillet Rules ---
-    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (where both edges are long)
-    Public Shared PlateCornerFilletRadiusMM As Double = 3.0      ' Radius (mm) for standard plate corners
+    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (both edges > MaxNibEdgeLengthMM)
+    Public Shared PlateCornerFilletRadiusMM As Double = 10.0      ' Radius (mm) for standard plate corners
     Public Shared PlateCornersConcaveOnly As Boolean = True      ' True = only inner cutouts/junctions; False = inner + outer corners
 
     ' --- Geometric Classification Tolerances ---
@@ -49,7 +51,7 @@ End Class
 ' ============================================================
 Sub Main()
     Logger.Start()
-    Logger.Section("STARTING AUTOMATED PLATE FILLETING (v2.0)")
+    Logger.Section("STARTING AUTOMATED PLATE FILLETING (v3.0)")
 
     Dim AssemblyDoc As Inventor.AssemblyDocument = Nothing
 
@@ -136,11 +138,17 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
     Dim PlateFileName As String = System.IO.Path.GetFileName(PlateDoc.FullFileName)
     Logger.Section("PROCESSING PLATE: " & PlateFileName)
 
-    Dim PlateDef As Inventor.PartComponentDefinition = CType(PlateDoc.ComponentDefinition, Inventor.PartComponentDefinition)
+    Dim SMDef As Inventor.SheetMetalComponentDefinition = TryCast(PlateDoc.ComponentDefinition, Inventor.SheetMetalComponentDefinition)
+    If SMDef Is Nothing Then
+        Logger.Warning("Skipped (not a SheetMetalComponentDefinition).")
+        Return False
+    End If
+
+    Dim SMFeatures As Inventor.SheetMetalFeatures = CType(SMDef.Features, Inventor.SheetMetalFeatures)
 
     ' 1. Guard against duplicate runs
     If FilletConfig.SkipIfAlreadyFilleted Then
-        For Each F As Inventor.FilletFeature In PlateDef.Features.FilletFeatures
+        For Each F As Inventor.FilletFeature In SMFeatures.FilletFeatures
             If F.Name.StartsWith("NIB_AUTO_FILLET_", StringComparison.OrdinalIgnoreCase) Then
                 Logger.Info("Skipped (already filleted in a previous run).")
                 Return True
@@ -148,20 +156,20 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
         Next
     End If
 
-    ' 2. Verify single solid plate body & measure physical thickness
-    Dim PlateBody As Inventor.SurfaceBody = GetSingleSolidBody(PlateDef)
+    ' 2. Find the single SOLID body (explicitly ignores leftover Sculpt surface bodies)
+    Dim PlateBody As Inventor.SurfaceBody = GetSingleSolidBody(SMDef)
     If PlateBody Is Nothing Then
-        Logger.Warning("Skipped (expected a single solid body).")
+        Logger.Warning("Skipped (expected 1 solid body; found 0 or multiple solid bodies).")
         Return False
     End If
 
-    Dim ThickMM As Double = GetPhysicalPlateThicknessMM(PlateDoc)
+    Dim ThickMM As Double = GetPhysicalPlateThicknessMM(PlateDoc, SMDef)
     If ThickMM <= 0 Then
         Logger.Warning("Skipped (unable to determine physical plate thickness).")
         Return False
     End If
 
-    ' 3. Identify the broad planar face
+    ' 3. Identify the broad planar face on the solid body
     Dim MainFace As Inventor.Face = FindBroadPlanarFace(PlateDoc, PlateBody, ThickMM)
     If MainFace Is Nothing Then
         Logger.Warning("Skipped (no broad planar face found).")
@@ -172,87 +180,89 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
     Dim PlateCornerEdges As Inventor.EdgeCollection = ThisApplication.TransientObjects.CreateEdgeCollection()
     Dim SeenEdgeKeys As New System.Collections.Generic.HashSet(Of Integer)
 
-    ' 4. Scan all vertices around the broad face loops to classify corners by adjacent edge lengths
+' 4. Collect unique vertices from the broad face's boundary edges
+    Dim LoopVertices As New System.Collections.Generic.List(Of Inventor.Vertex)
+    Dim SeenVertexKeys As New System.Collections.Generic.HashSet(Of Integer)
+
     For Each LoopObj As Inventor.EdgeLoop In MainFace.EdgeLoops
-        For Each Vtx As Inventor.Vertex In LoopObj.Vertices
-            If Vtx Is Nothing Then Continue For
-
-            Dim VerticalEdge As Inventor.Edge = Nothing
-            Dim InPlaneEdges As New System.Collections.Generic.List(Of Inventor.Edge)
-
-            For Each ConnectedEdge As Inventor.Edge In Vtx.Edges
-                If ConnectedEdge Is Nothing Then Continue For
-                Dim Orientation As String = ClassifyEdgeAgainstFaceNormal(MainFace, ConnectedEdge, FilletConfig.OrientationToleranceDegrees)
-                If Orientation = "THICKNESS-DIRECTION" Then
-                    VerticalEdge = ConnectedEdge
-                ElseIf Orientation = "IN-PLANE" Then
-                    InPlaneEdges.Add(ConnectedEdge)
-                End If
-            Next
-
-            If VerticalEdge Is Nothing OrElse InPlaneEdges.Count < 2 Then Continue For
-            If Not SeenEdgeKeys.Add(VerticalEdge.TransientKey) Then Continue For
-
-            ' Check corner turn angle and whether the corner is concave (re-entrant) or convex
-            Dim TurnAngleDeg As Double = 0
-            Dim IsConcave As Boolean = False
-            If Not AnalyzeCornerGeometry(MainFace, Vtx, InPlaneEdges(0), InPlaneEdges(1), TurnAngleDeg, IsConcave) Then Continue For
-            If TurnAngleDeg < FilletConfig.MinimumCornerAngleDeg Then Continue For
-
-            ' Measure lengths of the two meeting in-plane edges
-            Dim Len1MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(0))
-            Dim Len2MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(1))
-            Dim ShorterMM As Double = Math.Min(Len1MM, Len2MM)
-            Dim LongerMM As Double = Math.Max(Len1MM, Len2MM)
-
-            ' Classify corner based on adjacent edge lengths:
-            ' A nib-to-plate root corner is CONCAVE, with one short nib side wall (<= MaxNibSideWallLengthMM)
-            ' meeting one long plate edge (>= MinPlateEdgeAdjacentToNibMM).
-            Dim IsNibRootCorner As Boolean = _
-                IsConcave AndAlso _
-                (ShorterMM <= FilletConfig.MaxNibSideWallLengthMM) AndAlso _
-                (LongerMM >= FilletConfig.MinPlateEdgeAdjacentToNibMM)
-
-            If IsNibRootCorner Then
-                If FilletConfig.FilletNibJunctions Then
-                    NibJunctionEdges.Add(VerticalEdge)
-                    Logger.Debug("Nib root corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
-                End If
-            ElseIf ShorterMM > FilletConfig.MaxNibSideWallLengthMM Then
-                ' Both edges are longer than a nib side wall -> standard plate corner
-                If FilletConfig.FilletPlateCorners Then
-                    If Not FilletConfig.PlateCornersConcaveOnly OrElse IsConcave Then
-                        PlateCornerEdges.Add(VerticalEdge)
-                        Logger.Debug("Plate corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
-                    End If
-                End If
+        For Each BoundaryEdge As Inventor.Edge In LoopObj.Edges
+            If BoundaryEdge Is Nothing Then Continue For
+            If BoundaryEdge.StartVertex IsNot Nothing AndAlso SeenVertexKeys.Add(BoundaryEdge.StartVertex.TransientKey) Then
+                LoopVertices.Add(BoundaryEdge.StartVertex)
+            End If
+            If BoundaryEdge.StopVertex IsNot Nothing AndAlso SeenVertexKeys.Add(BoundaryEdge.StopVertex.TransientKey) Then
+                LoopVertices.Add(BoundaryEdge.StopVertex)
             End If
         Next
     Next
 
-    Logger.Info("Corners found -> Nib junctions: " & NibJunctionEdges.Count & " | Plate corners: " & PlateCornerEdges.Count)
+    ' Classify each corner vertex by its connected vertical edge and adjacent in-plane edge lengths
+    For Each Vtx As Inventor.Vertex In LoopVertices
+        Dim VerticalEdge As Inventor.Edge = Nothing
+        Dim InPlaneEdges As New System.Collections.Generic.List(Of Inventor.Edge)
 
-    If NibJunctionEdges.Count = 0 AndAlso PlateCornerEdges.Count = 0 Then
-        Return True
-    End If
+        For Each ConnectedEdge As Inventor.Edge In Vtx.Edges
+            If ConnectedEdge Is Nothing Then Continue For
+            Dim Orientation As String = ClassifyEdgeAgainstFaceNormal(MainFace, ConnectedEdge, FilletConfig.OrientationToleranceDegrees)
+            If Orientation = "THICKNESS-DIRECTION" Then
+                VerticalEdge = ConnectedEdge
+            ElseIf Orientation = "IN-PLANE" Then
+                InPlaneEdges.Add(ConnectedEdge)
+            End If
+        Next
 
-    ' 5. Apply FilletFeatures inside an undoable transaction
+        If VerticalEdge Is Nothing OrElse InPlaneEdges.Count < 2 Then Continue For
+        If Not SeenEdgeKeys.Add(VerticalEdge.TransientKey) Then Continue For
+
+        ' Check corner turn angle and whether the corner is concave (re-entrant) or convex
+        Dim TurnAngleDeg As Double = 0
+        Dim IsConcave As Boolean = False
+        If Not AnalyzeCornerGeometry(MainFace, Vtx, InPlaneEdges(0), InPlaneEdges(1), TurnAngleDeg, IsConcave) Then Continue For
+        If TurnAngleDeg < FilletConfig.MinimumCornerAngleDeg Then Continue For
+
+        ' Measure true curve lengths of the two meeting in-plane edges
+        Dim Len1MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(0))
+        Dim Len2MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(1))
+        Dim ShorterMM As Double = Math.Min(Len1MM, Len2MM)
+        Dim LongerMM As Double = Math.Max(Len1MM, Len2MM)
+
+        ' Classify corner based on adjacent edge lengths:
+        ' A nib-to-plate root corner is CONCAVE, with one short nib edge/arc (<= MaxNibEdgeLengthMM)
+        ' meeting one long plate edge (>= MinPlateEdgeAdjacentToNibMM).
+        Dim IsNibRootCorner As Boolean = _
+            IsConcave AndAlso _
+            (ShorterMM <= FilletConfig.MaxNibEdgeLengthMM) AndAlso _
+            (LongerMM >= FilletConfig.MinPlateEdgeAdjacentToNibMM)
+
+        If IsNibRootCorner Then
+            If FilletConfig.FilletNibJunctions Then
+                NibJunctionEdges.Add(VerticalEdge)
+                Logger.Debug("Nib root corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
+            End If
+        ElseIf ShorterMM > FilletConfig.MaxNibEdgeLengthMM Then
+            ' Both edges are longer than a nib boundary -> standard plate corner
+            If FilletConfig.FilletPlateCorners Then
+                If Not FilletConfig.PlateCornersConcaveOnly OrElse IsConcave Then
+                    PlateCornerEdges.Add(VerticalEdge)
+                    Logger.Debug("Plate corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
+                End If
+            End If
+        End If
+    Next
+
+    ' 5. Apply SheetMetal FilletFeatures inside an undoable transaction
     Dim Tx As Inventor.Transaction = Nothing
     Try
         Tx = ThisApplication.TransactionManager.StartTransaction(PlateDoc, "Automated Plate Corner Filleting")
 
         If NibJunctionEdges.Count > 0 Then
             Dim NibRadCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits(FilletConfig.NibJunctionFilletRadiusMM, "mm", "cm")
-            Dim NibFillet As Inventor.FilletFeature = PlateDef.Features.FilletFeatures.AddSimple(NibJunctionEdges, NibRadCM)
-            NibFillet.Name = "NIB_AUTO_FILLET_JUNCTIONS"
-            Logger.Success("Filleted " & NibJunctionEdges.Count & " nib junction corner(s) at R" & FilletConfig.NibJunctionFilletRadiusMM & " mm.")
+            ApplyFilletBatchWithFallback(SMFeatures, NibJunctionEdges, NibRadCM, "NIB_AUTO_FILLET_JUNCTIONS")
         End If
 
         If PlateCornerEdges.Count > 0 Then
             Dim PlateRadCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits(FilletConfig.PlateCornerFilletRadiusMM, "mm", "cm")
-            Dim PlateFillet As Inventor.FilletFeature = PlateDef.Features.FilletFeatures.AddSimple(PlateCornerEdges, PlateRadCM)
-            PlateFillet.Name = "NIB_AUTO_FILLET_CORNERS"
-            Logger.Success("Filleted " & PlateCornerEdges.Count & " plate corner(s) at R" & FilletConfig.PlateCornerFilletRadiusMM & " mm.")
+            ApplyFilletBatchWithFallback(SMFeatures, PlateCornerEdges, PlateRadCM, "NIB_AUTO_FILLET_CORNERS")
         End If
 
         PlateDoc.Update2(True)
@@ -260,11 +270,43 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
         Return True
 
     Catch ex As Exception
-        Logger.Error("Fillet feature failed on " & PlateFileName & ": " & ex.Message)
+        Logger.Error("Fillet transaction failed on " & PlateFileName & ": " & ex.Message)
         If Tx IsNot Nothing Then Try : Tx.Abort() : Catch : End Try
         Return False
     End Try
 End Function
+
+' Tries to fillet all edges in one clean feature; if one edge fails due to tight local geometry,
+' falls back to filleting edges individually so the remaining corners still succeed.
+Sub ApplyFilletBatchWithFallback( _
+    SMFeatures As Inventor.SheetMetalFeatures, _
+    Edges As Inventor.EdgeCollection, _
+    RadiusCM As Double, _
+    FeatureBaseName As String)
+
+    Try
+        Dim Feat As Inventor.FilletFeature = SMFeatures.FilletFeatures.AddSimple(Edges, RadiusCM)
+        Feat.Name = FeatureBaseName
+        Logger.Success("Created " & FeatureBaseName & " across " & Edges.Count & " edge(s).")
+        Exit Sub
+    Catch
+        Logger.Warning("Batch fillet failed for " & FeatureBaseName & "; retrying per-edge...")
+    End Try
+
+    Dim SuccessCount As Integer = 0
+    For i As Integer = 1 To Edges.Count
+        Try
+            Dim SingleEdge As Inventor.EdgeCollection = ThisApplication.TransientObjects.CreateEdgeCollection()
+            SingleEdge.Add(Edges.Item(i))
+            Dim Feat As Inventor.FilletFeature = SMFeatures.FilletFeatures.AddSimple(SingleEdge, RadiusCM)
+            SuccessCount += 1
+            Feat.Name = FeatureBaseName & "_" & SuccessCount.ToString("000")
+        Catch ex As Exception
+            Logger.Debug("Skipped single edge " & i & " in " & FeatureBaseName & ": " & ex.Message)
+        End Try
+    Next
+    Logger.Success("Created " & SuccessCount & "/" & Edges.Count & " individual fillets for " & FeatureBaseName & ".")
+End Sub
 
 
 ' ============================================================
@@ -299,12 +341,11 @@ Function AnalyzeCornerGeometry( _
         Dim InteriorAngleDeg As Double = Math.Acos(Dot) * (180.0 / Math.PI)
         OutTurnAngleDeg = Math.Abs(180.0 - InteriorAngleDeg)
 
-        ' Bisector between the two outgoing edge tangents
         Dim Bisector As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector(T1.X + T2.X, T1.Y + T2.Y, T1.Z + T2.Z)
         If Bisector.Length < 0.000001 Then Return False
         Bisector.Normalize()
 
-        ' Step 0.2 mm along the bisector: if the point lands OFF the metal face, the corner is CONCAVE (re-entrant)
+        ' Step 0.2 mm along the bisector: if the point lands OFF the metal face, the corner is CONCAVE
         Dim TestPt As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
             CornerVtx.Point.X + (Bisector.X * 0.02), _
             CornerVtx.Point.Y + (Bisector.Y * 0.02), _
@@ -389,9 +430,9 @@ Function ClassifyEdgeAgainstFaceNormal(Face As Inventor.Face, Edge As Inventor.E
     End Try
 End Function
 
-Function GetSingleSolidBody(PartDef As Inventor.PartComponentDefinition) As Inventor.SurfaceBody
+Function GetSingleSolidBody(SMDef As Inventor.SheetMetalComponentDefinition) As Inventor.SurfaceBody
     Dim Found As Inventor.SurfaceBody = Nothing
-    For Each B As Inventor.SurfaceBody In PartDef.SurfaceBodies
+    For Each B As Inventor.SurfaceBody In SMDef.SurfaceBodies
         If B IsNot Nothing AndAlso B.IsSolid Then
             If Found IsNot Nothing Then Return Nothing
             Found = B
@@ -400,13 +441,9 @@ Function GetSingleSolidBody(PartDef As Inventor.PartComponentDefinition) As Inve
     Return Found
 End Function
 
-Function GetPhysicalPlateThicknessMM(PartDoc As Inventor.PartDocument) As Double
+Function GetPhysicalPlateThicknessMM(PartDoc As Inventor.PartDocument, SMDef As Inventor.SheetMetalComponentDefinition) As Double
     Try
-        Dim Box As Inventor.OrientedBox = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition).OrientedMinimumRangeBox
-        Dim D1 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionOne.Length, "cm", "mm")
-        Dim D2 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionTwo.Length, "cm", "mm")
-        Dim D3 As Double = PartDoc.UnitsOfMeasure.ConvertUnits(Box.DirectionThree.Length, "cm", "mm")
-        Return Math.Min(D1, Math.Min(D2, D3))
+        Return PartDoc.UnitsOfMeasure.ConvertUnits(SMDef.Thickness.Value, "cm", "mm")
     Catch
         Return 0
     End Try
@@ -450,11 +487,21 @@ Class Logger
         If FilletConfig.EnableDiagnosticLog Then Lines.Add(vbCrLf & "--- " & Title & " ---")
     End Sub
 
-    Public Shared Sub Info(Msg As String) : Log("INFO", Msg) : End Sub
-    Public Shared Sub Success(Msg As String) : Log("SUCCESS", Msg) : End Sub
-    Public Shared Sub Warning(Msg As String) : Log("WARNING", Msg) : End Sub
-    Public Shared Sub [Error](Msg As String) : Log("ERROR", Msg) : End Sub
-    Public Shared Sub Debug(Msg As String) : Log("DEBUG", Msg) : End Sub
+    Public Shared Sub Info(Msg As String)
+		Log("INFO", Msg)
+		End Sub
+    Public Shared Sub Success(Msg As String)
+		Log("SUCCESS", Msg)
+		End Sub
+    Public Shared Sub Warning(Msg As String)
+		Log("WARNING", Msg)
+		End Sub
+    Public Shared Sub [Error](Msg As String)
+		Log("ERROR", Msg)
+		End Sub
+    Public Shared Sub Debug(Msg As String)
+		Log("DEBUG", Msg)
+		End Sub
 
     Private Shared Sub Log(Level As String, Msg As String)
         If FilletConfig.EnableDiagnosticLog Then
