@@ -843,11 +843,21 @@ Class Logger
         WriteRaw(vbCrLf & "--- " & Title & " ---")
     End Sub
 
-    Public Shared Sub Info(Msg As String) : Log("INFO", Msg) : End Sub
-    Public Shared Sub Success(Msg As String) : Log("SUCCESS", Msg) : End Sub
-    Public Shared Sub Warning(Msg As String) : Log("WARNING", Msg) : End Sub
-    Public Shared Sub [Error](Msg As String) : Log("ERROR", Msg) : End Sub
-    Public Shared Sub Debug(Msg As String) : Log("DEBUG", Msg) : End Sub
+    Public Shared Sub Info(Msg As String)
+        Log("INFO", Msg)
+    End Sub
+    Public Shared Sub Success(Msg As String)
+        Log("SUCCESS", Msg)
+    End Sub
+    Public Shared Sub Warning(Msg As String)
+        Log("WARNING", Msg)
+    End Sub
+    Public Shared Sub [Error](Msg As String)
+        Log("ERROR", Msg)
+    End Sub
+    Public Shared Sub Debug(Msg As String)
+        Log("DEBUG", Msg)
+    End Sub
 
     Private Shared Sub Log(Level As String, Msg As String)
         If Not NibConfig.EnableDiagnosticLog Then Exit Sub
