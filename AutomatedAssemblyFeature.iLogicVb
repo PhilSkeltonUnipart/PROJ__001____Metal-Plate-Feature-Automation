@@ -1,6 +1,6 @@
 Option Explicit On
 ' ============================================================
-' INVENTOR NIB AUTOMATION (v0.8.0 - Multi-Thickness <X>mm-STD-NIB)
+' INVENTOR NIB AUTOMATION (V0.8.2 - Variables)
 '
 ' Automatically matches each plate's measured physical thickness
 ' to <X>mm-STD-NIB.ipt in the local or central server folder.
@@ -19,20 +19,20 @@ Class NibConfig
     Public Shared PlateComponentType As String = "PL"
     Public Shared NibFileSuffix As String = "mm-STD-NIB.ipt"
     Public Shared CentralNibFolder As String = "V:\05 Engineering\05-02 CAD\AutoDesk\UCT - Content Centre\01 - USER COMMAND AUTOMATION GEOMETRY"
-    Public Shared MaxStagingOccurrences As Integer = 300
+    Public Shared MaxStagingOccurrences As Integer = 1000
 
-    ' --- Nibbing Edge & Spacing Rules (mm) ---
-    Public Shared MinimumNibEdgeLengthMM As Double = 150.0
-    Public Shared ExternalEndClearanceMM As Double = 75.0
-    Public Shared InternalEndClearanceMM As Double = 50.0
-    Public Shared MaximumNibSpacingMM As Double = 300.0
-    Public Shared ExternalMinimumUsableLengthMM As Double = 150.0
-    Public Shared InternalMinimumUsableLengthMM As Double = 150.0
-    Public Shared MinimumNibCentreSeparationMM As Double = 150.0
-    Public Shared LongEdgeThresholdRatio As Double = 0.75  ' Used by "Internal openings - long edges only"
+	' --- Nibbing Edge & Spacing Rules (mm) ---
+    Public Shared MinimumNibEdgeLengthMM As Double = 24.0         ' Lowered from 150 mm so shorter edges can still take nibs
+    Public Shared ExternalEndClearanceMM As Double = 12.0         ' Distance from external corners (was 75 mm)
+    Public Shared InternalEndClearanceMM As Double = 10.0         ' Distance from internal corners (was 50 mm)
+    Public Shared MaximumNibSpacingMM As Double = 27.5            ' Upper spacing bound (was 300 mm)
+    Public Shared ExternalMinimumUsableLengthMM As Double = 0.0   ' Set to 0 so edges that only fit 1 centered nib still work
+    Public Shared InternalMinimumUsableLengthMM As Double = 0.0   ' Set to 0 so edges that only fit 1 centered nib still work
+    Public Shared MinimumNibCentreSeparationMM As Double = 18.0   ' Lower spacing bound (was 150 mm)
+    Public Shared LongEdgeThresholdRatio As Double = 0.75		  ' Used by "Internal openings - long edges only"
 
     ' --- Geometry & Join Tolerances ---
-    Public Shared NibJoinOverlapMM As Double = 0.2
+    Public Shared NibJoinOverlapMM As Double = 2.0
     Public Shared NibThicknessMatchToleranceMM As Double = 0.25
     Public Shared ThicknessWarningToleranceMM As Double = 0.1
     Public Shared OrientationToleranceDegrees As Double = 1.0
@@ -341,23 +341,33 @@ Sub AnalyzePlateGeometry( _
                 If UsableLengthMM < MinUsableMM Then Continue For
                 If NibProfile = "Internal openings - long edges only" AndAlso EdgeLengthMM < (LongestEdgeMM * NibConfig.LongEdgeThresholdRatio) Then Continue For
 
+                ' --- UPDATED SPACING LOGIC (18–25 mm pitch + single centred nib for short edges) ---
                 Dim IntervalCount As Integer = CInt(Math.Ceiling(UsableLengthMM / NibConfig.MaximumNibSpacingMM))
                 If IsClosed AndAlso IntervalCount < 2 Then IntervalCount = 2
-                If IntervalCount < 1 Then IntervalCount = 1
 
-                Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
-                If ActualSpacingMM < NibConfig.MinimumNibCentreSeparationMM Then
-                    Logger.Info("Rejected edge (spacing " & Math.Round(ActualSpacingMM, 1) & " mm < min separation).")
-                    Continue For
-                End If
-
-                Dim MaxIndex As Integer = If(IsClosed, IntervalCount - 1, IntervalCount)
-                For PosIndex As Integer = 0 To MaxIndex
-                    Dim DistanceMM As Double = EndClearanceMM + (PosIndex * ActualSpacingMM)
+                If Not IsClosed AndAlso UsableLengthMM < NibConfig.MinimumNibCentreSeparationMM Then
+                    ' Usable span is too short for 2 nibs at >= 18 mm apart, so place 1 nib dead-centre
                     AddNibPlacementAndMarker( _
-                        PartDoc, MainFace, Edge, DistanceMM, PhysicalThicknessMM, NibFilePath, _
+                        PartDoc, MainFace, Edge, EdgeLengthMM / 2.0, PhysicalThicknessMM, NibFilePath, _
                         OccurrenceTransform, IsOuter, InternalMarkers, ExternalMarkers, Placements)
-                Next
+                Else
+                    If IntervalCount < 1 Then IntervalCount = 1
+                    Dim ActualSpacingMM As Double = UsableLengthMM / IntervalCount
+
+                    If ActualSpacingMM < NibConfig.MinimumNibCentreSeparationMM Then
+                        Logger.Info("Rejected edge (spacing " & Math.Round(ActualSpacingMM, 1) & " mm < min separation).")
+                        Continue For
+                    End If
+
+                    Dim MaxIndex As Integer = If(IsClosed, IntervalCount - 1, IntervalCount)
+                    For PosIndex As Integer = 0 To MaxIndex
+                        Dim DistanceMM As Double = EndClearanceMM + (PosIndex * ActualSpacingMM)
+                        AddNibPlacementAndMarker( _
+                            PartDoc, MainFace, Edge, DistanceMM, PhysicalThicknessMM, NibFilePath, _
+                            OccurrenceTransform, IsOuter, InternalMarkers, ExternalMarkers, Placements)
+                    Next
+                End If
+                ' ----------------------------------------------------------------------------------
             Next
         Next
     Next
