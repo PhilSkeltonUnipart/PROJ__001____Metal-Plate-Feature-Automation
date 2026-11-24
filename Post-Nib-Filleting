@@ -1,6 +1,6 @@
 Option Explicit On
 ' ============================================================
-' INVENTOR AUTOMATED PLATE CORNER FILLETING (V0.3.1 - Nibbing Join Radius Change)
+' INVENTOR AUTOMATED PLATE CORNER FILLETING (V0.3.2 - Corner Radius Change)
 '
 ' Purpose:
 '   - Runs from the active assembly AFTER nibs have been sculpted/joined
@@ -37,7 +37,7 @@ Class FilletConfig
 
     ' --- Standard Plate Corner Fillet Rules ---
     Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (both edges > MaxNibEdgeLengthMM)
-    Public Shared PlateCornerFilletRadiusMM As Double = 10.0      ' Radius (mm) for standard plate corners
+    Public Shared PlateCornerFilletRadiusMM As Double = 3.0      ' Radius (mm) for standard plate corners
     Public Shared PlateCornersConcaveOnly As Boolean = True      ' True = only inner cutouts/junctions; False = inner + outer corners
 
     ' --- Geometric Classification Tolerances ---
