@@ -1,6 +1,6 @@
 Option Explicit On
 ' ============================================================
-' INVENTOR AUTOMATED PLATE CORNER FILLETING (V0.3.2 - Corner Radius Change)
+' INVENTOR AUTOMATED PLATE CORNER FILLETING (v0.3.3 - Variable Changes)
 '
 ' Purpose:
 '   - Runs from the active assembly AFTER nibs have been sculpted/joined
@@ -25,20 +25,18 @@ Class FilletConfig
     Public Shared PlateComponentType As String = "PL"
     Public Shared SkipIfAlreadyFilleted As Boolean = True      ' Prevents duplicate runs on the same plate
 
-    ' --- Geometric Nib Recognition ---
-    ' A nib-to-plate junction is a CONCAVE corner where a short nib edge/arc
-    ' (<= MaxNibEdgeLengthMM) meets a longer plate edge (>= MinPlateEdgeAdjacentToNibMM).
-    Public Shared MaxNibEdgeLengthMM As Double = 15.0          ' Max arc/edge length (mm) of a nib boundary
-    Public Shared MinPlateEdgeAdjacentToNibMM As Double = 20.0 ' Min length (mm) of the plate edge next to a nib
+' --- Geometric Nib Recognition ---
+    Public Shared MaxNibEdgeLengthMM As Double = 10.0          ' Max length (mm) of a nib side wall
+    Public Shared MinPlateEdgeAdjacentToNibMM As Double = 2.0  ' Lowered so nibs 12mm from corners still match!
 
     ' --- Nib-to-Plate Junction Fillet Rules ---
     Public Shared FilletNibJunctions As Boolean = True           ' Fillet sharp inner roots where nib meets plate
-    Public Shared NibJunctionFilletRadiusMM As Double = 0.5      ' Radius (mm) for nib-to-plate root corners
+    Public Shared NibJunctionFilletRadiusMM As Double = 0.75      ' Radius (mm) for nib-to-plate root corners
 
     ' --- Standard Plate Corner Fillet Rules ---
-    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (both edges > MaxNibEdgeLengthMM)
+    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners
     Public Shared PlateCornerFilletRadiusMM As Double = 3.0      ' Radius (mm) for standard plate corners
-    Public Shared PlateCornersConcaveOnly As Boolean = True      ' True = only inner cutouts/junctions; False = inner + outer corners
+    Public Shared PlateCornersConcaveOnly As Boolean = False     ' Changed to False so sharp plate corners get filleted too!
 
     ' --- Geometric Classification Tolerances ---
     Public Shared MinimumCornerAngleDeg As Double = 15.0         ' Ignore smooth/tangent curves (< 15 deg corner turn)
@@ -130,7 +128,6 @@ Sub CollectEligiblePlateDocs( _
     Next
 End Sub
 
-
 ' ============================================================
 ' PER-PLATE CORNER DETECTION & FILLET EXECUTION
 ' ============================================================
@@ -180,7 +177,7 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
     Dim PlateCornerEdges As Inventor.EdgeCollection = ThisApplication.TransientObjects.CreateEdgeCollection()
     Dim SeenEdgeKeys As New System.Collections.Generic.HashSet(Of Integer)
 
-' 4. Collect unique vertices from the broad face's boundary edges
+    ' 4. Collect unique vertices from the broad face's boundary edges
     Dim LoopVertices As New System.Collections.Generic.List(Of Inventor.Vertex)
     Dim SeenVertexKeys As New System.Collections.Generic.HashSet(Of Integer)
 
@@ -220,15 +217,13 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
         If Not AnalyzeCornerGeometry(MainFace, Vtx, InPlaneEdges(0), InPlaneEdges(1), TurnAngleDeg, IsConcave) Then Continue For
         If TurnAngleDeg < FilletConfig.MinimumCornerAngleDeg Then Continue For
 
-        ' Measure true curve lengths of the two meeting in-plane edges
+        ' --- UPDATED CORNER CLASSIFICATION BLOCK ---
         Dim Len1MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(0))
         Dim Len2MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(1))
         Dim ShorterMM As Double = Math.Min(Len1MM, Len2MM)
         Dim LongerMM As Double = Math.Max(Len1MM, Len2MM)
 
-        ' Classify corner based on adjacent edge lengths:
-        ' A nib-to-plate root corner is CONCAVE, with one short nib edge/arc (<= MaxNibEdgeLengthMM)
-        ' meeting one long plate edge (>= MinPlateEdgeAdjacentToNibMM).
+        ' 1. Nib-to-plate root corner: CONCAVE corner where at least one edge is a short nib wall
         Dim IsNibRootCorner As Boolean = _
             IsConcave AndAlso _
             (ShorterMM <= FilletConfig.MaxNibEdgeLengthMM) AndAlso _
@@ -239,8 +234,8 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
                 NibJunctionEdges.Add(VerticalEdge)
                 Logger.Debug("Nib root corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
             End If
-        ElseIf ShorterMM > FilletConfig.MaxNibEdgeLengthMM Then
-            ' Both edges are longer than a nib boundary -> standard plate corner
+        ElseIf LongerMM > FilletConfig.MaxNibEdgeLengthMM Then
+            ' 2. Standard plate corner: at least one edge is a main plate edge (> MaxNibEdgeLengthMM)
             If FilletConfig.FilletPlateCorners Then
                 If Not FilletConfig.PlateCornersConcaveOnly OrElse IsConcave Then
                     PlateCornerEdges.Add(VerticalEdge)
@@ -248,7 +243,14 @@ Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
                 End If
             End If
         End If
+        ' -----------------------------------------
     Next
+
+    Logger.Info("Corners queued -> Nib junctions: " & NibJunctionEdges.Count & " | Plate corners: " & PlateCornerEdges.Count)
+
+    If NibJunctionEdges.Count = 0 AndAlso PlateCornerEdges.Count = 0 Then
+        Return True
+    End If
 
     ' 5. Apply SheetMetal FilletFeatures inside an undoable transaction
     Dim Tx As Inventor.Transaction = Nothing
