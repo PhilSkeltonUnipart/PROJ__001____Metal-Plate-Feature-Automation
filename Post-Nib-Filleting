@@ -1,14 +1,13 @@
 ' ============================================================
-' INVENTOR AUTOMATED PLATE CORNER FILLETING (v1.0.0 - Standalone)
+' INVENTOR AUTOMATED PLATE CORNER FILLETING (v2.0.0 - Geometry-Based)
 '
 ' Purpose:
-'   - Designed to be called sequentially by a Master iLogic rule
-'     AFTER nibs have been placed and combined into PL plates.
-'   - Scans the active assembly (including subassemblies) for
-'     eligible sheet-metal PL parts.
-'   - Differentiates concave nib-to-plate root junctions from
-'     standard plate corners and applies separate FilletFeatures.
-'   - Zero pop-up dialogs; silent file logging controlled via toggle.
+'   - Called sequentially by a Master iLogic rule AFTER nibs have
+'     been joined into PL sheet-metal plates.
+'   - Uses adjacent edge lengths + concave corner topology to
+'     distinguish nib-to-plate root junctions from standard plate
+'     corners—works even if feature names change.
+'   - Zero pop-ups; silent file logging controlled via toggle.
 ' ============================================================
 
 Option Explicit On
@@ -17,27 +16,31 @@ Option Explicit On
 ' USER CONFIGURATION & TOGGLES (EDIT RULES HERE)
 ' ============================================================
 Class FilletConfig
-    ' --- Diagnostic Toggles (Code-Only, No Pop-Ups) ---
+    ' --- Diagnostic Toggle (Code-Only, No Pop-Ups) ---
     Public Shared EnableDiagnosticLog As Boolean = False       ' True = writes .log file next to assembly
 
     ' --- Component Filtering ---
     Public Shared PlateComponentType As String = "PL"
     Public Shared SkipIfAlreadyFilleted As Boolean = True      ' Prevents duplicate runs on the same plate
 
+    ' --- Geometric Nib Recognition (Based on Nib Protrusion Length) ---
+    ' At a nib-to-plate root corner, one edge is the short nib side wall (<= MaxNibSideWallLengthMM)
+    ' and the other edge is the plate boundary (>= MinPlateEdgeAdjacentToNibMM).
+    Public Shared MaxNibSideWallLengthMM As Double = 12.0      ' Max length (mm) of the nib's protruding side edge
+    Public Shared MinPlateEdgeAdjacentToNibMM As Double = 20.0 ' Min length (mm) of the plate edge next to a nib
+
     ' --- Nib-to-Plate Junction Fillet Rules ---
     Public Shared FilletNibJunctions As Boolean = True           ' Fillet sharp inner roots where nib meets plate
-    Public Shared NibJunctionFilletRadiusMM As Double = 2.0      ' Radius (mm) for nib-to-plate root corners
-    Public Shared NibFeaturePrefix As String = "NIB_AUTO_"       ' Feature name prefix created by nib/join scripts
-    Public Shared NibJunctionProximityMM As Double = 3.0         ' Tolerance (mm) around joined nib feature bounds
+    Public Shared NibJunctionFilletRadiusMM As Double = 1.5      ' Radius (mm) for nib-to-plate root corners
 
     ' --- Standard Plate Corner Fillet Rules ---
-    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (non-nib)
+    Public Shared FilletPlateCorners As Boolean = True           ' Fillet standard plate corners (where both edges are long)
     Public Shared PlateCornerFilletRadiusMM As Double = 3.0      ' Radius (mm) for standard plate corners
-    Public Shared PlateCornersConcaveOnly As Boolean = True      ' True = only inner cutouts/notches; False = inner + outer corners
+    Public Shared PlateCornersConcaveOnly As Boolean = True      ' True = only inner cutouts/junctions; False = inner + outer corners
 
     ' --- Geometric Classification Tolerances ---
     Public Shared MinimumCornerAngleDeg As Double = 15.0         ' Ignore smooth/tangent curves (< 15 deg corner turn)
-    Public Shared OrientationToleranceDegrees As Double = 1.0    ' Tolerance for vertical thickness-direction edges
+    Public Shared OrientationToleranceDegrees As Double = 2.0    ' Tolerance for vertical thickness-direction edges
 End Class
 
 
@@ -46,7 +49,7 @@ End Class
 ' ============================================================
 Sub Main()
     Logger.Start()
-    Logger.Section("STARTING AUTOMATED PLATE FILLETING")
+    Logger.Section("STARTING AUTOMATED PLATE FILLETING (v2.0)")
 
     Dim AssemblyDoc As Inventor.AssemblyDocument = Nothing
 
@@ -61,17 +64,17 @@ Sub Main()
         AssemblyDoc = CType(ActiveDoc, Inventor.AssemblyDocument)
         Logger.Info("Assembly: " & AssemblyDoc.DisplayName)
 
-        ' Collect unique eligible PL sheet-metal plate file paths across the assembly tree
-        Dim PlatePaths As New System.Collections.Generic.HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-        CollectEligiblePlatePaths(AssemblyDoc.ComponentDefinition.Occurrences, PlatePaths)
+        ' Collect unique eligible PL sheet-metal plate documents from the assembly
+        Dim PlateDocs As New System.Collections.Generic.Dictionary(Of String, Inventor.PartDocument)(StringComparer.OrdinalIgnoreCase)
+        CollectEligiblePlateDocs(AssemblyDoc.ComponentDefinition.Occurrences, PlateDocs)
 
-        Logger.Info("Unique eligible PL sheet-metal plates found: " & PlatePaths.Count)
+        Logger.Info("Unique eligible PL sheet-metal plates found: " & PlateDocs.Count)
 
         Dim ProcessedCount As Integer = 0
         Dim FailedCount As Integer = 0
 
-        For Each PlatePath As String In PlatePaths
-            If ProcessPlateFilleting(PlatePath) Then
+        For Each Kvp In PlateDocs
+            If ProcessPlateFilleting(Kvp.Value) Then
                 ProcessedCount += 1
             Else
                 FailedCount += 1
@@ -79,6 +82,7 @@ Sub Main()
         Next
 
         AssemblyDoc.Update2(True)
+        ThisApplication.ActiveView.Update()
 
         Logger.Section("FILLETING SUMMARY")
         Logger.Info("Plates processed: " & ProcessedCount & " | Skipped/Failed: " & FailedCount)
@@ -96,16 +100,16 @@ End Sub
 ' ============================================================
 ' RECURSIVE ASSEMBLY PLATE COLLECTOR
 ' ============================================================
-Sub CollectEligiblePlatePaths( _
+Sub CollectEligiblePlateDocs( _
     Occurrences As Inventor.ComponentOccurrences, _
-    PlatePaths As System.Collections.Generic.HashSet(Of String))
+    PlateDocs As System.Collections.Generic.Dictionary(Of String, Inventor.PartDocument))
 
     For Each Occ As Inventor.ComponentOccurrence In Occurrences
         If Occ.Suppressed Then Continue For
 
         If Occ.DefinitionDocumentType = Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
             Dim SubDoc As Inventor.AssemblyDocument = CType(Occ.Definition.Document, Inventor.AssemblyDocument)
-            CollectEligiblePlatePaths(SubDoc.ComponentDefinition.Occurrences, PlatePaths)
+            CollectEligiblePlateDocs(SubDoc.ComponentDefinition.Occurrences, PlateDocs)
             Continue For
         End If
 
@@ -118,7 +122,9 @@ Sub CollectEligiblePlatePaths( _
         If CompType <> FilletConfig.PlateComponentType Then Continue For
         If Not (TypeOf PartDoc.ComponentDefinition Is Inventor.SheetMetalComponentDefinition) Then Continue For
 
-        PlatePaths.Add(PartDoc.FullFileName)
+        If Not PlateDocs.ContainsKey(PartDoc.FullFileName) Then
+            PlateDocs.Add(PartDoc.FullFileName, PartDoc)
+        End If
     Next
 End Sub
 
@@ -126,17 +132,9 @@ End Sub
 ' ============================================================
 ' PER-PLATE CORNER DETECTION & FILLET EXECUTION
 ' ============================================================
-Function ProcessPlateFilleting(PlatePath As String) As Boolean
-    Dim PlateFileName As String = System.IO.Path.GetFileName(PlatePath)
+Function ProcessPlateFilleting(PlateDoc As Inventor.PartDocument) As Boolean
+    Dim PlateFileName As String = System.IO.Path.GetFileName(PlateDoc.FullFileName)
     Logger.Section("PROCESSING PLATE: " & PlateFileName)
-
-    Dim PlateDoc As Inventor.PartDocument = Nothing
-    Try
-        PlateDoc = CType(ThisApplication.Documents.Open(PlatePath, False), Inventor.PartDocument)
-    Catch ex As Exception
-        Logger.Error("Could not open plate: " & ex.Message)
-        Return False
-    End Try
 
     Dim PlateDef As Inventor.PartComponentDefinition = CType(PlateDoc.ComponentDefinition, Inventor.PartComponentDefinition)
 
@@ -170,16 +168,11 @@ Function ProcessPlateFilleting(PlatePath As String) As Boolean
         Return False
     End If
 
-    ' 4. Gather bounding boxes of all joined nib features on this plate
-    Dim NibFeatureBoxes As System.Collections.Generic.List(Of Inventor.Box) = GetJoinedNibFeatureBoxes(PlateDef)
-    Logger.Info("Detected joined nib feature regions: " & NibFeatureBoxes.Count)
-
-    Dim ProximityCM As Double = PlateDoc.UnitsOfMeasure.ConvertUnits(FilletConfig.NibJunctionProximityMM, "mm", "cm")
     Dim NibJunctionEdges As Inventor.EdgeCollection = ThisApplication.TransientObjects.CreateEdgeCollection()
     Dim PlateCornerEdges As Inventor.EdgeCollection = ThisApplication.TransientObjects.CreateEdgeCollection()
     Dim SeenEdgeKeys As New System.Collections.Generic.HashSet(Of Integer)
 
-    ' 5. Scan all vertices around the broad face loops to find vertical thickness edges
+    ' 4. Scan all vertices around the broad face loops to classify corners by adjacent edge lengths
     For Each LoopObj As Inventor.EdgeLoop In MainFace.EdgeLoops
         For Each Vtx As Inventor.Vertex In LoopObj.Vertices
             If Vtx Is Nothing Then Continue For
@@ -206,31 +199,44 @@ Function ProcessPlateFilleting(PlatePath As String) As Boolean
             If Not AnalyzeCornerGeometry(MainFace, Vtx, InPlaneEdges(0), InPlaneEdges(1), TurnAngleDeg, IsConcave) Then Continue For
             If TurnAngleDeg < FilletConfig.MinimumCornerAngleDeg Then Continue For
 
-            ' Determine if this vertex belongs to a joined nib feature
-            Dim IsNibCorner As Boolean = IsPointNearAnyNibBox(Vtx.Point, NibFeatureBoxes, ProximityCM)
+            ' Measure lengths of the two meeting in-plane edges
+            Dim Len1MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(0))
+            Dim Len2MM As Double = GetEdgeLengthMM(PlateDoc, InPlaneEdges(1))
+            Dim ShorterMM As Double = Math.Min(Len1MM, Len2MM)
+            Dim LongerMM As Double = Math.Max(Len1MM, Len2MM)
 
-            If IsNibCorner Then
-                ' Only fillet the concave root corners where the nib meets the plate
-                ' (protects the outer convex tip corners of the nib itself)
-                If FilletConfig.FilletNibJunctions AndAlso IsConcave Then
+            ' Classify corner based on adjacent edge lengths:
+            ' A nib-to-plate root corner is CONCAVE, with one short nib side wall (<= MaxNibSideWallLengthMM)
+            ' meeting one long plate edge (>= MinPlateEdgeAdjacentToNibMM).
+            Dim IsNibRootCorner As Boolean = _
+                IsConcave AndAlso _
+                (ShorterMM <= FilletConfig.MaxNibSideWallLengthMM) AndAlso _
+                (LongerMM >= FilletConfig.MinPlateEdgeAdjacentToNibMM)
+
+            If IsNibRootCorner Then
+                If FilletConfig.FilletNibJunctions Then
                     NibJunctionEdges.Add(VerticalEdge)
+                    Logger.Debug("Nib root corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
                 End If
-            Else
+            ElseIf ShorterMM > FilletConfig.MaxNibSideWallLengthMM Then
+                ' Both edges are longer than a nib side wall -> standard plate corner
                 If FilletConfig.FilletPlateCorners Then
                     If Not FilletConfig.PlateCornersConcaveOnly OrElse IsConcave Then
                         PlateCornerEdges.Add(VerticalEdge)
+                        Logger.Debug("Plate corner queued (edges: " & Math.Round(ShorterMM, 2) & " mm & " & Math.Round(LongerMM, 2) & " mm)")
                     End If
                 End If
             End If
         Next
     Next
 
+    Logger.Info("Corners found -> Nib junctions: " & NibJunctionEdges.Count & " | Plate corners: " & PlateCornerEdges.Count)
+
     If NibJunctionEdges.Count = 0 AndAlso PlateCornerEdges.Count = 0 Then
-        Logger.Info("No eligible corners found to fillet on this plate.")
         Return True
     End If
 
-    ' 6. Apply FilletFeatures inside an undoable transaction
+    ' 5. Apply FilletFeatures inside an undoable transaction
     Dim Tx As Inventor.Transaction = Nothing
     Try
         Tx = ThisApplication.TransactionManager.StartTransaction(PlateDoc, "Automated Plate Corner Filleting")
@@ -262,49 +268,18 @@ End Function
 
 
 ' ============================================================
-' NIB FEATURE & CORNER GEOMETRY HELPERS
+' CORNER & EDGE GEOMETRY HELPERS
 ' ============================================================
-Function GetJoinedNibFeatureBoxes(PlateDef As Inventor.PartComponentDefinition) As System.Collections.Generic.List(Of Inventor.Box)
-    Dim Boxes As New System.Collections.Generic.List(Of Inventor.Box)
-
-    ' Check CombineFeatures first (created when nibs are Boolean-joined)
-    For Each JoinFeat As Inventor.CombineFeature In PlateDef.Features.CombineFeatures
-        If JoinFeat IsNot Nothing AndAlso JoinFeat.Name.StartsWith(FilletConfig.NibFeaturePrefix, StringComparison.OrdinalIgnoreCase) Then
-            Try
-                If JoinFeat.RangeBox IsNot Nothing Then Boxes.Add(JoinFeat.RangeBox)
-            Catch
-            End Try
-        End If
-    Next
-
-    ' Also check NonParametricBaseFeatures in case nibs were copied/joined via base bodies
-    If Boxes.Count = 0 Then
-        For Each BaseFeat As Inventor.NonParametricBaseFeature In PlateDef.Features.NonParametricBaseFeatures
-            If BaseFeat IsNot Nothing AndAlso BaseFeat.Name.StartsWith(FilletConfig.NibFeaturePrefix, StringComparison.OrdinalIgnoreCase) Then
-                Try
-                    If BaseFeat.RangeBox IsNot Nothing Then Boxes.Add(BaseFeat.RangeBox)
-                Catch
-                End Try
-            End If
-        Next
-    End If
-
-    Return Boxes
-End Function
-
-Function IsPointNearAnyNibBox( _
-    Pt As Inventor.Point, _
-    Boxes As System.Collections.Generic.List(Of Inventor.Box), _
-    ToleranceCM As Double) As Boolean
-
-    For Each B As Inventor.Box In Boxes
-        If Pt.X >= (B.MinPoint.X - ToleranceCM) AndAlso Pt.X <= (B.MaxPoint.X + ToleranceCM) AndAlso _
-           Pt.Y >= (B.MinPoint.Y - ToleranceCM) AndAlso Pt.Y <= (B.MaxPoint.Y + ToleranceCM) AndAlso _
-           Pt.Z >= (B.MinPoint.Z - ToleranceCM) AndAlso Pt.Z <= (B.MaxPoint.Z + ToleranceCM) Then
-            Return True
-        End If
-    Next
-    Return False
+Function GetEdgeLengthMM(PartDoc As Inventor.PartDocument, Edge As Inventor.Edge) As Double
+    Try
+        Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
+        Dim MinP As Double = 0, MaxP As Double = 0, LenCM As Double = 0
+        Eval.GetParamExtents(MinP, MaxP)
+        Eval.GetLengthAtParam(MinP, MaxP, LenCM)
+        Return PartDoc.UnitsOfMeasure.ConvertUnits(LenCM, "cm", "mm")
+    Catch
+        Return 0
+    End Try
 End Function
 
 Function AnalyzeCornerGeometry( _
@@ -377,11 +352,7 @@ Function FindBroadPlanarFace(PartDoc As Inventor.PartDocument, Body As Inventor.
         Dim LongCount As Integer = 0
         For Each LoopObj As Inventor.EdgeLoop In Face.EdgeLoops
             For Each Edge As Inventor.Edge In LoopObj.Edges
-                Dim Eval As Inventor.CurveEvaluator = Edge.Evaluator
-                Dim MinP As Double = 0, MaxP As Double = 0, LenCM As Double = 0
-                Eval.GetParamExtents(MinP, MaxP)
-                Eval.GetLengthAtParam(MinP, MaxP, LenCM)
-                If PartDoc.UnitsOfMeasure.ConvertUnits(LenCM, "cm", "mm") > ThresholdMM Then LongCount += 1
+                If GetEdgeLengthMM(PartDoc, Edge) > ThresholdMM Then LongCount += 1
             Next
         Next
         If LongCount > BestLongEdges OrElse (LongCount = BestLongEdges AndAlso Area > BestArea) Then
@@ -479,21 +450,11 @@ Class Logger
         If FilletConfig.EnableDiagnosticLog Then Lines.Add(vbCrLf & "--- " & Title & " ---")
     End Sub
 
-    Public Shared Sub Info(Msg As String)
-      Log("INFO", Msg)
-    End Sub
-    Public Shared Sub Success(Msg As String)
-      Log("SUCCESS", Msg)
-    End Sub
-    Public Shared Sub Warning(Msg As String)
-      Log("WARNING", Msg)
-    End Sub
-    Public Shared Sub [Error](Msg As String)
-      Log("ERROR", Msg)
-    End Sub
-    Public Shared Sub Debug(Msg As String)
-      Log(""DEBUG", Msg)
-    End Sub
+    Public Shared Sub Info(Msg As String) : Log("INFO", Msg) : End Sub
+    Public Shared Sub Success(Msg As String) : Log("SUCCESS", Msg) : End Sub
+    Public Shared Sub Warning(Msg As String) : Log("WARNING", Msg) : End Sub
+    Public Shared Sub [Error](Msg As String) : Log("ERROR", Msg) : End Sub
+    Public Shared Sub Debug(Msg As String) : Log("DEBUG", Msg) : End Sub
 
     Private Shared Sub Log(Level As String, Msg As String)
         If FilletConfig.EnableDiagnosticLog Then
