@@ -1,9 +1,9 @@
 Option Explicit On
 ' ============================================================
-' INVENTOR NIB AUTOMATION (v0.7.1 - Optomising for Sharing with ohers)
+' INVENTOR NIB AUTOMATION (v0.8.0 - Multi-Thickness <X>mm-STD-NIB)
 '
-' It now should be able to take the nib geometry from the server 
-' rather than a local file.
+' Automatically matches each plate's measured physical thickness
+' to <X>mm-STD-NIB.ipt in the local or central server folder.
 ' ============================================================
 
 
@@ -17,8 +17,8 @@ Class NibConfig
 
     ' --- Component & Reference Rules ---
     Public Shared PlateComponentType As String = "PL"
-    Public Shared DefaultNibFileName As String = "3mm-STD-NIB.ipt"
-	Public Shared CentralNibFolder As String = "V:\05 Engineering\05-02 CAD\AutoDesk\UCT - Content Centre\01 - USER COMMAND AUTOMATION GEOMETRY"
+    Public Shared NibFileSuffix As String = "mm-STD-NIB.ipt"
+    Public Shared CentralNibFolder As String = "V:\05 Engineering\05-02 CAD\AutoDesk\UCT - Content Centre\01 - USER COMMAND AUTOMATION GEOMETRY"
     Public Shared MaxStagingOccurrences As Integer = 300
 
     ' --- Nibbing Edge & Spacing Rules (mm) ---
@@ -44,7 +44,7 @@ End Class
 ' ============================================================
 Sub Main()
     Logger.Start()
-    Logger.Section("STARTING ASSEMBLY SCAN")
+    Logger.Section("STARTING ASSEMBLY SCAN (MULTI-THICKNESS)")
 
     Dim AssemblyDoc As Inventor.AssemblyDocument = Nothing
 
@@ -72,34 +72,29 @@ Sub Main()
             "Inventor Nib Automation - Profile", "Nibbing profiles")
         If String.IsNullOrWhiteSpace(NibProfile) Then Exit Sub
 
-        ' 2. Locate Reference Nib Part (silent if in assembly folder)
-        Dim NibReferenceFile As String = ResolveNibReferenceFile(AssemblyDoc)
-        If String.IsNullOrWhiteSpace(NibReferenceFile) Then
-            Logger.Warning("Nib reference part not found/selected. Geometry generation skipped.")
-        End If
-
-        ' 3. Scan Assembly & Analyse Plate Boundaries
+        ' 2. Scan Assembly, Resolve <X>mm-STD-NIB.ipt Per Plate & Analyse Boundaries
         Dim Stats As New ScanStats()
         Dim InternalMarkers As New System.Collections.Generic.List(Of Double)
         Dim ExternalMarkers As New System.Collections.Generic.List(Of Double)
         Dim Placements As New System.Collections.Generic.List(Of NibPlacement)
+        Dim NibCache As New System.Collections.Generic.Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
         Dim RootTransform As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
 
         ScanOccurrences( _
-            AssemblyDoc.ComponentDefinition.Occurrences, NibProfile, RootTransform, _
-            InternalMarkers, ExternalMarkers, Placements, Stats)
+            AssemblyDoc, AssemblyDoc.ComponentDefinition.Occurrences, NibProfile, RootTransform, _
+            NibCache, InternalMarkers, ExternalMarkers, Placements, Stats)
 
-        ' 4. Draw or Clear Temporary 3D Candidate Markers
+        ' 3. Draw or Clear Temporary 3D Candidate Markers
         UpdateCandidateMarkers(AssemblyDoc, InternalMarkers, ExternalMarkers)
 
-        ' 5. Stage Nib Occurrences & Join Solids into Plates (No Confirmation Pop-Ups)
-        If Not String.IsNullOrWhiteSpace(NibReferenceFile) AndAlso Placements.Count > 0 Then
+        ' 4. Stage Nib Occurrences & Join Solids into Plates
+        If Placements.Count > 0 Then
             Dim StagingOccurrences As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)
-            If CreateNibStagingOccurrences(AssemblyDoc, NibReferenceFile, Placements, StagingOccurrences) Then
-                GenerateNibGeometryInPlateParts(NibReferenceFile, Placements, StagingOccurrences)
+            If CreateNibStagingOccurrences(AssemblyDoc, Placements, StagingOccurrences) Then
+                GenerateNibGeometryInPlateParts(Placements, StagingOccurrences)
             End If
         Else
-            Logger.Warning("No nib geometry generated (no valid placements or missing nib reference).")
+            Logger.Warning("No nib geometry generated (no valid placements or matching <X>mm-STD-NIB.ipt files).")
         End If
 
         Logger.Section("SCAN SUMMARY")
@@ -131,6 +126,7 @@ End Class
 
 Class NibPlacement
     Public PlatePath As String
+    Public NibFilePath As String
     ' Plate-local frame
     Public PartOrigin As Inventor.Point
     Public PartX As Inventor.Vector
@@ -149,9 +145,11 @@ End Class
 ' RECURSIVE ASSEMBLY SCANNER
 ' ============================================================
 Sub ScanOccurrences( _
+    RootAssemblyDoc As Inventor.AssemblyDocument, _
     Occurrences As Inventor.ComponentOccurrences, _
     NibProfile As String, _
     ParentTransform As Inventor.Matrix, _
+    NibCache As System.Collections.Generic.Dictionary(Of String, String), _
     InternalMarkers As System.Collections.Generic.List(Of Double), _
     ExternalMarkers As System.Collections.Generic.List(Of Double), _
     Placements As System.Collections.Generic.List(Of NibPlacement), _
@@ -168,8 +166,8 @@ Sub ScanOccurrences( _
         If Occ.DefinitionDocumentType = Inventor.DocumentTypeEnum.kAssemblyDocumentObject Then
             Stats.SubAssemblies += 1
             Dim SubDoc As Inventor.AssemblyDocument = CType(Occ.Definition.Document, Inventor.AssemblyDocument)
-            ScanOccurrences(SubDoc.ComponentDefinition.Occurrences, NibProfile, CurrentTransform, _
-                            InternalMarkers, ExternalMarkers, Placements, Stats)
+            ScanOccurrences(RootAssemblyDoc, SubDoc.ComponentDefinition.Occurrences, NibProfile, CurrentTransform, _
+                            NibCache, InternalMarkers, ExternalMarkers, Placements, Stats)
             Continue For
         End If
 
@@ -206,11 +204,70 @@ Sub ScanOccurrences( _
                            " mm) differs from physical (" & Math.Round(PhysicalThicknessMM, 3) & " mm).")
         End If
 
+        ' Resolve matching <Thickness>mm-STD-NIB.ipt for this plate
+        Dim NibFilePath As String = ResolveNibForThickness(RootAssemblyDoc, PhysicalThicknessMM, NibCache)
+        If String.IsNullOrWhiteSpace(NibFilePath) Then
+            Logger.Warning(PartName & ": No matching nib file found for " & Math.Round(PhysicalThicknessMM, 2) & " mm plate. Skipped.")
+            Continue For
+        End If
+
         Stats.EligiblePlates += 1
-        AnalyzePlateGeometry(PartDoc, Occ.Name, NibProfile, PhysicalThicknessMM, CurrentTransform, _
+        AnalyzePlateGeometry(PartDoc, Occ.Name, NibProfile, PhysicalThicknessMM, NibFilePath, CurrentTransform, _
                              InternalMarkers, ExternalMarkers, Placements)
     Next
 End Sub
+
+
+' ============================================================
+' THICKNESS-BASED NIB RESOLVER
+' ============================================================
+Function ResolveNibForThickness( _
+    AssemblyDoc As Inventor.AssemblyDocument, _
+    PhysicalThicknessMM As Double, _
+    NibCache As System.Collections.Generic.Dictionary(Of String, String)) As String
+
+    ' Format thickness cleanly: e.g. 3.0 -> "3", 6.0 -> "6", 1.5 -> "1.5"
+    Dim RoundedMM As Double = Math.Round(PhysicalThicknessMM, 1)
+    Dim ThicknessLabel As String = RoundedMM.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)
+    Dim TargetFileName As String = ThicknessLabel & NibConfig.NibFileSuffix
+
+    If NibCache.ContainsKey(TargetFileName) Then
+        Return NibCache(TargetFileName)
+    End If
+
+    Dim FoundPath As String = ""
+
+    ' 1. Check active assembly's local folder first
+    Try
+        If AssemblyDoc IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(AssemblyDoc.FullFileName) Then
+            Dim AsmFolder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
+            Dim LocalPath As String = System.IO.Path.Combine(AsmFolder, TargetFileName)
+            If System.IO.File.Exists(LocalPath) Then
+                FoundPath = LocalPath
+                Logger.Info("Resolved local nib for " & ThicknessLabel & " mm: " & FoundPath)
+            End If
+        End If
+    Catch
+    End Try
+
+    ' 2. Check central shared network folder
+    If String.IsNullOrWhiteSpace(FoundPath) Then
+        Try
+            If Not String.IsNullOrWhiteSpace(NibConfig.CentralNibFolder) Then
+                Dim CentralPath As String = System.IO.Path.Combine(NibConfig.CentralNibFolder, TargetFileName)
+                If System.IO.File.Exists(CentralPath) Then
+                    FoundPath = CentralPath
+                    Logger.Info("Resolved central nib for " & ThicknessLabel & " mm: " & FoundPath)
+                End If
+            End If
+        Catch
+        End Try
+    End If
+
+    ' Cache result (even if empty) so we only check disk once per thickness
+    NibCache(TargetFileName) = FoundPath
+    Return FoundPath
+End Function
 
 
 ' ============================================================
@@ -221,19 +278,19 @@ Sub AnalyzePlateGeometry( _
     OccurrenceName As String, _
     NibProfile As String, _
     PhysicalThicknessMM As Double, _
+    NibFilePath As String, _
     OccurrenceTransform As Inventor.Matrix, _
     InternalMarkers As System.Collections.Generic.List(Of Double), _
     ExternalMarkers As System.Collections.Generic.List(Of Double), _
     Placements As System.Collections.Generic.List(Of NibPlacement))
 
-    Logger.Section("ANALYSING PLATE: " & OccurrenceName)
+    Logger.Section("ANALYSING PLATE: " & OccurrenceName & " (" & System.IO.Path.GetFileName(NibFilePath) & ")")
     Dim PartDef As Inventor.PartComponentDefinition = CType(PartDoc.ComponentDefinition, Inventor.PartComponentDefinition)
     Dim ThicknessScaleThresholdMM As Double = Math.Max(PhysicalThicknessMM * 2.0, 1.0)
 
     For Each Body As Inventor.SurfaceBody In PartDef.SurfaceBodies
         If Body Is Nothing OrElse Not Body.IsSolid Then Continue For
 
-        ' Select broad planar face by long boundary edge count, tie-breaking with area
         Dim MainFace As Inventor.Face = Nothing
         Dim BestLongEdgeCount As Integer = -1
         Dim BestFaceArea As Double = -1
@@ -298,7 +355,7 @@ Sub AnalyzePlateGeometry( _
                 For PosIndex As Integer = 0 To MaxIndex
                     Dim DistanceMM As Double = EndClearanceMM + (PosIndex * ActualSpacingMM)
                     AddNibPlacementAndMarker( _
-                        PartDoc, MainFace, Edge, DistanceMM, PhysicalThicknessMM, _
+                        PartDoc, MainFace, Edge, DistanceMM, PhysicalThicknessMM, NibFilePath, _
                         OccurrenceTransform, IsOuter, InternalMarkers, ExternalMarkers, Placements)
                 Next
             Next
@@ -316,6 +373,7 @@ Sub AddNibPlacementAndMarker( _
     Edge As Inventor.Edge, _
     DistanceAlongEdgeMM As Double, _
     PhysicalThicknessMM As Double, _
+    NibFilePath As String, _
     OccurrenceTransform As Inventor.Matrix, _
     IsOuterLoop As Boolean, _
     InternalMarkers As System.Collections.Generic.List(Of Double), _
@@ -327,7 +385,6 @@ Sub AddNibPlacementAndMarker( _
         Dim Tangent As Inventor.Vector = Nothing
         If Not TryEvaluateEdgeAtDistanceMM(PartDoc, Edge, DistanceAlongEdgeMM, EdgePoint, Tangent) Then Exit Sub
 
-        ' Store marker coordinate if visual markers are enabled
         If NibConfig.ShowCandidateMarkers Then
             Dim MarkerPt As Inventor.Point = EdgePoint.Copy()
             MarkerPt.TransformBy(OccurrenceTransform)
@@ -335,7 +392,6 @@ Sub AddNibPlacementAndMarker( _
             TargetList.Add(MarkerPt.X) : TargetList.Add(MarkerPt.Y) : TargetList.Add(MarkerPt.Z)
         End If
 
-        ' True topological outward normal of the solid broad face
         Dim FaceEval As Inventor.SurfaceEvaluator = BroadFace.Evaluator
         Dim PtArr() As Double = {EdgePoint.X, EdgePoint.Y, EdgePoint.Z}
         Dim Guess() As Double = {}, MaxDev() As Double = {}, Params() As Double = {}, SolNatures() As Inventor.SolutionNatureEnum = {}
@@ -347,7 +403,6 @@ Sub AddNibPlacementAndMarker( _
         If OutwardFaceNormal.Length < 0.000001 Then Exit Sub
         OutwardFaceNormal.Normalize()
 
-        ' Perpendicular in-plane vector; probe 0.5 mm to guarantee it points AWAY from solid material
         Dim OutwardEdge As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
             (Tangent.Y * OutwardFaceNormal.Z) - (Tangent.Z * OutwardFaceNormal.Y), _
             (Tangent.Z * OutwardFaceNormal.X) - (Tangent.X * OutwardFaceNormal.Z), _
@@ -363,7 +418,6 @@ Sub AddNibPlacementAndMarker( _
             OutwardEdge.ScaleBy(-1.0)
         End If
 
-        ' Right-handed nib frame (+Y = outward from cut edge, +X = outward face normal, +Z = tangent)
         Dim YAxis As Inventor.Vector = OutwardEdge
         Dim XAxis As Inventor.Vector = OutwardFaceNormal
         Dim ZAxis As Inventor.Vector = ThisApplication.TransientGeometry.CreateVector( _
@@ -373,14 +427,12 @@ Sub AddNibPlacementAndMarker( _
         If ZAxis.Length < 0.000001 Then Exit Sub
         ZAxis.Normalize()
 
-        ' Centre origin on the plate mid-plane
         Dim HalfThickCM As Double = PartDoc.UnitsOfMeasure.ConvertUnits(PhysicalThicknessMM / 2.0, "mm", "cm")
         Dim OriginPart As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint( _
             EdgePoint.X - (XAxis.X * HalfThickCM), _
             EdgePoint.Y - (XAxis.Y * HalfThickCM), _
             EdgePoint.Z - (XAxis.Z * HalfThickCM))
 
-        ' Transform frame to assembly coordinates
         Dim O As Inventor.Point = OriginPart.Copy() : O.TransformBy(OccurrenceTransform)
         Dim XP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(OriginPart.X + XAxis.X, OriginPart.Y + XAxis.Y, OriginPart.Z + XAxis.Z) : XP.TransformBy(OccurrenceTransform)
         Dim YP As Inventor.Point = ThisApplication.TransientGeometry.CreatePoint(OriginPart.X + YAxis.X, OriginPart.Y + YAxis.Y, OriginPart.Z + YAxis.Z) : YP.TransformBy(OccurrenceTransform)
@@ -392,6 +444,7 @@ Sub AddNibPlacementAndMarker( _
 
         Dim P As New NibPlacement With { _
             .PlatePath = PartDoc.FullFileName, _
+            .NibFilePath = NibFilePath, _
             .PartOrigin = OriginPart, .PartX = XAxis, .PartY = YAxis, .PartZ = ZAxis, _
             .AsmOrigin = O, .AsmX = AX, .AsmY = AY, .AsmZ = AZ, _
             .StagingIndex = Placements.Count}
@@ -405,44 +458,8 @@ End Sub
 ' ============================================================
 ' STAGING OCCURRENCES & TRANSIENT B-REP SOLID JOIN
 ' ============================================================
-Function ResolveNibReferenceFile(AssemblyDoc As Inventor.AssemblyDocument) As String
-    ' 1. Check the active assembly's local folder first (allows project-specific overrides)
-    Try
-        If AssemblyDoc IsNot Nothing AndAlso Not String.IsNullOrWhiteSpace(AssemblyDoc.FullFileName) Then
-            Dim AsmFolder As String = System.IO.Path.GetDirectoryName(AssemblyDoc.FullFileName)
-            Dim LocalPath As String = System.IO.Path.Combine(AsmFolder, NibConfig.DefaultNibFileName)
-            If System.IO.File.Exists(LocalPath) Then
-                Logger.Info("Using local assembly nib reference: " & LocalPath)
-                Return LocalPath
-            End If
-        End If
-    Catch
-    End Try
-
-    ' 2. Check the central shared network folder automatically (silent team fallback)
-    Try
-        If Not String.IsNullOrWhiteSpace(NibConfig.CentralNibFolder) Then
-            Dim CentralPath As String = System.IO.Path.Combine(NibConfig.CentralNibFolder, NibConfig.DefaultNibFileName)
-            If System.IO.File.Exists(CentralPath) Then
-                Logger.Info("Using central standard nib reference: " & CentralPath)
-                Return CentralPath
-            End If
-        End If
-    Catch
-    End Try
-
-    ' 3. Fallback to manual file picker only if neither location has the file
-    Dim Dialog As New System.Windows.Forms.OpenFileDialog With { _
-        .Title = "Select the nib reference part", _
-        .Filter = "Inventor Part (*.ipt)|*.ipt", _
-        .FileName = NibConfig.DefaultNibFileName, _
-        .CheckFileExists = True}
-    Return If(Dialog.ShowDialog() = System.Windows.Forms.DialogResult.OK, Dialog.FileName, "")
-End Function
-
 Function CreateNibStagingOccurrences( _
     AssemblyDoc As Inventor.AssemblyDocument, _
-    NibFilePath As String, _
     Placements As System.Collections.Generic.List(Of NibPlacement), _
     StagingOccurrences As System.Collections.Generic.List(Of Inventor.ComponentOccurrence)) As Boolean
 
@@ -460,7 +477,7 @@ Function CreateNibStagingOccurrences( _
             Dim M As Inventor.Matrix = ThisApplication.TransientGeometry.CreateMatrix()
             M.SetCoordinateSystem(OverlappedOrigin, P.AsmX, P.AsmY, P.AsmZ)
 
-            Dim Occ As Inventor.ComponentOccurrence = AssemblyDoc.ComponentDefinition.Occurrences.Add(NibFilePath, M)
+            Dim Occ As Inventor.ComponentOccurrence = AssemblyDoc.ComponentDefinition.Occurrences.Add(P.NibFilePath, M)
             If Occ Is Nothing Then Throw New Exception("Occurrences.Add returned Nothing.")
             StagingOccurrences.Add(Occ)
         Catch ex As Exception
@@ -474,30 +491,24 @@ Function CreateNibStagingOccurrences( _
 End Function
 
 Sub GenerateNibGeometryInPlateParts( _
-    NibFilePath As String, _
     Placements As System.Collections.Generic.List(Of NibPlacement), _
     StagingOccurrences As System.Collections.Generic.List(Of Inventor.ComponentOccurrence))
 
-    Dim NibDoc As Inventor.PartDocument = CType(ThisApplication.Documents.Open(NibFilePath, False), Inventor.PartDocument)
-    Dim NibBody As Inventor.SurfaceBody = GetSingleSolidBody(CType(NibDoc.ComponentDefinition, Inventor.PartComponentDefinition))
-    If NibBody Is Nothing Then
-        Logger.Error("Nib reference part must contain exactly one solid body.")
-        Exit Sub
-    End If
-
-    Dim NibThicknessMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(Math.Abs(NibBody.RangeBox.MaxPoint.X - NibBody.RangeBox.MinPoint.X), "cm", "mm")
-    Dim NibMinYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MinPoint.Y, "cm", "mm")
-    Dim NibMaxYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MaxPoint.Y, "cm", "mm")
-    If Math.Abs(NibMinYMM) > 0.1 OrElse NibMaxYMM <= NibMinYMM Then
-        Logger.Error("Nib solid must start at ZX attachment plane (Y ~ 0) and project toward +Y.")
-        Exit Sub
-    End If
+    ' Validate each unique nib file once and cache its thickness
+    Dim NibThicknessCache As New System.Collections.Generic.Dictionary(Of String, Double)(StringComparer.OrdinalIgnoreCase)
 
     Dim ProcessedFiles As New System.Collections.Generic.HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
 
     For Each P As NibPlacement In Placements
         If ProcessedFiles.Contains(P.PlatePath) Then Continue For
         ProcessedFiles.Add(P.PlatePath)
+
+        Dim NibThicknessMM As Double = 0
+        If Not NibThicknessCache.TryGetValue(P.NibFilePath, NibThicknessMM) Then
+            NibThicknessMM = ValidateAndGetNibThicknessMM(P.NibFilePath)
+            NibThicknessCache(P.NibFilePath) = NibThicknessMM
+        End If
+        If NibThicknessMM <= 0 Then Continue For
 
         Dim PlateRecords As New System.Collections.Generic.List(Of NibPlacement)
         For Each Candidate As NibPlacement In Placements
@@ -507,7 +518,6 @@ Sub GenerateNibGeometryInPlateParts( _
         Dim PlateDoc As Inventor.PartDocument = CType(ThisApplication.Documents.Open(P.PlatePath, False), Inventor.PartDocument)
         Dim PlateDef As Inventor.PartComponentDefinition = CType(PlateDoc.ComponentDefinition, Inventor.PartComponentDefinition)
 
-        ' Skip if already generated
         Dim AlreadyGenerated As Boolean = False
         For Each JoinFeat As Inventor.CombineFeature In PlateDef.Features.CombineFeatures
             If JoinFeat.Name.StartsWith("NIB_AUTO_JOIN_", StringComparison.OrdinalIgnoreCase) Then AlreadyGenerated = True : Exit For
@@ -517,7 +527,7 @@ Sub GenerateNibGeometryInPlateParts( _
         Dim DummyParam As Double = 0
         Dim PlateThicknessMM As Double = GetPhysicalPlateThicknessMM(PlateDoc, DummyParam)
         If PlateThicknessMM <= 0 OrElse Math.Abs(PlateThicknessMM - NibThicknessMM) > NibConfig.NibThicknessMatchToleranceMM Then
-            Logger.Error("Thickness mismatch or unreadable on: " & System.IO.Path.GetFileName(P.PlatePath))
+            Logger.Error("Thickness mismatch between " & System.IO.Path.GetFileName(P.PlatePath) & " and " & System.IO.Path.GetFileName(P.NibFilePath))
             Continue For
         End If
 
@@ -527,7 +537,6 @@ Sub GenerateNibGeometryInPlateParts( _
             Continue For
         End If
 
-        ' Deduplicate placements from multiple assembly instances of the same plate
         Dim UniqueRecords As New System.Collections.Generic.List(Of NibPlacement)
         Dim SeenKeys As New System.Collections.Generic.HashSet(Of String)
         For Each Rec As NibPlacement In PlateRecords
@@ -586,7 +595,6 @@ Sub GenerateNibGeometryInPlateParts( _
             If Tx IsNot Nothing Then Try : Tx.Abort() : Catch : End Try
         End Try
 
-        ' Remove temporary assembly nibs only if this plate succeeded
         If Succeeded Then
             For Each Completed As NibPlacement In PlateRecords
                 Dim Idx As Integer = Completed.StagingIndex
@@ -599,6 +607,29 @@ Sub GenerateNibGeometryInPlateParts( _
 
     Try : ThisApplication.ActiveView.Update() : Catch : End Try
 End Sub
+
+Function ValidateAndGetNibThicknessMM(NibFilePath As String) As Double
+    Try
+        Dim NibDoc As Inventor.PartDocument = CType(ThisApplication.Documents.Open(NibFilePath, False), Inventor.PartDocument)
+        Dim NibBody As Inventor.SurfaceBody = GetSingleSolidBody(CType(NibDoc.ComponentDefinition, Inventor.PartComponentDefinition))
+        If NibBody Is Nothing Then
+            Logger.Error("Nib reference must contain a single solid body: " & NibFilePath)
+            Return -1
+        End If
+
+        Dim NibThicknessMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(Math.Abs(NibBody.RangeBox.MaxPoint.X - NibBody.RangeBox.MinPoint.X), "cm", "mm")
+        Dim NibMinYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MinPoint.Y, "cm", "mm")
+        Dim NibMaxYMM As Double = NibDoc.UnitsOfMeasure.ConvertUnits(NibBody.RangeBox.MaxPoint.Y, "cm", "mm")
+        If Math.Abs(NibMinYMM) > 0.1 OrElse NibMaxYMM <= NibMinYMM Then
+            Logger.Error("Nib solid must start at ZX plane (Y ~ 0) and project toward +Y: " & NibFilePath)
+            Return -1
+        End If
+        Return NibThicknessMM
+    Catch ex As Exception
+        Logger.Error("Failed validating nib file " & NibFilePath & ": " & ex.Message)
+        Return -1
+    End Try
+End Function
 
 
 ' ============================================================
@@ -812,25 +843,11 @@ Class Logger
         WriteRaw(vbCrLf & "--- " & Title & " ---")
     End Sub
 
-	Public Shared Sub Info(Msg As String)
-	    Log("INFO", Msg)
-	End Sub
-	
-	Public Shared Sub Success(Msg As String)
-	    Log("SUCCESS", Msg)
-	End Sub
-	
-	Public Shared Sub Warning(Msg As String)
-	    Log("WARNING", Msg)
-	End Sub
-	
-	Public Shared Sub [Error](Msg As String)
-	    Log("ERROR", Msg)
-	End Sub
-	
-	Public Shared Sub Debug(Msg As String)
-	    Log("DEBUG", Msg)
-	End Sub
+    Public Shared Sub Info(Msg As String) : Log("INFO", Msg) : End Sub
+    Public Shared Sub Success(Msg As String) : Log("SUCCESS", Msg) : End Sub
+    Public Shared Sub Warning(Msg As String) : Log("WARNING", Msg) : End Sub
+    Public Shared Sub [Error](Msg As String) : Log("ERROR", Msg) : End Sub
+    Public Shared Sub Debug(Msg As String) : Log("DEBUG", Msg) : End Sub
 
     Private Shared Sub Log(Level As String, Msg As String)
         If Not NibConfig.EnableDiagnosticLog Then Exit Sub
