@@ -1,3 +1,16 @@
+' ============================================================
+' USER CONFIGURATION & TOGGLES
+' ============================================================
+Class JoinConfig
+    ' --- Pop-Up Toggles (Code-Only) ---
+    Public Shared ShowCompletionPopup As Boolean = False   ' True = shows "Done! Merged and deleted..." pop-up
+    Public Shared ShowNoMatchPopup As Boolean = False      ' True = shows "No matching plates or nibs found." pop-up
+End Class
+
+
+' ============================================================
+' MAIN ENTRY POINT
+' ============================================================
 Sub Main()
     Dim oApp As Inventor.Application = ThisApplication
     Dim oAsmDoc As AssemblyDocument = TryCast(oApp.ActiveDocument, AssemblyDocument)
@@ -23,7 +36,9 @@ Sub Main()
     Next
 
     If oPlates.Count = 0 OrElse oNibs.Count = 0 Then
-        MessageBox.Show("No matching plates or nibs found.", "iLogic")
+        If JoinConfig.ShowNoMatchPopup Then
+            MessageBox.Show("No matching plates or nibs found.", "iLogic")
+        End If
         Exit Sub
     End If
 
@@ -144,7 +159,10 @@ Sub Main()
 
         oApp.UserInterfaceManager.UserInteractionDisabled = False
         oApp.ScreenUpdating = True
-        MessageBox.Show("Done! Merged and deleted " & deletedCount & " nib(s).", "iLogic")
+
+        If JoinConfig.ShowCompletionPopup Then
+            MessageBox.Show("Done! Merged and deleted " & deletedCount & " nib(s).", "iLogic")
+        End If
 
     Catch ex As Exception
         oTrans.Abort()
